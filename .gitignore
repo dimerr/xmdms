@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.build/
+build/
+dist/
+*.ico
+cfgs/
+Web/
+getencode.py
+.env
