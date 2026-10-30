@@ -49,6 +49,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -86,6 +87,13 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
+)
+
+from i18n import (
+    load_language,
+    resolve_language,
+    set_language,
+    tr,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -819,6 +827,109 @@ def apply_password_visibility(visible=None):
         if (isinstance(widget, QLineEdit)
                 and bool(widget.property(PASSWORD_FIELD_PROPERTY))):
             widget.setEchoMode(mode)
+
+
+I18N_SOURCE_ROLE = Qt.ItemDataRole.UserRole + 120
+I18N_LAST_ROLE = Qt.ItemDataRole.UserRole + 121
+
+
+def _translate_property(obj, prefix, current, setter):
+    if not isinstance(current, str) or not current:
+        return
+    source_key = prefix + "_source"
+    last_key = prefix + "_last"
+    source = obj.property(source_key)
+    last = obj.property(last_key)
+    if not isinstance(source, str) or (isinstance(last, str)
+                                       and current != last):
+        source = current
+        obj.setProperty(source_key, source)
+    translated = tr(source)
+    obj.setProperty(last_key, translated)
+    if current != translated:
+        setter(translated)
+
+
+def _translate_table_header(item):
+    current = item.text()
+    source = item.data(I18N_SOURCE_ROLE)
+    last = item.data(I18N_LAST_ROLE)
+    if not isinstance(source, str) or (isinstance(last, str)
+                                       and current != last):
+        source = current
+        item.setData(I18N_SOURCE_ROLE, source)
+    translated = tr(source)
+    item.setData(I18N_LAST_ROLE, translated)
+    if current != translated:
+        item.setText(translated)
+
+
+def _translate_tabs(tabs):
+    sources = tabs.property("_i18n_tabs_sources")
+    if not isinstance(sources, list) or len(sources) != tabs.count():
+        sources = [tabs.tabText(index) for index in range(tabs.count())]
+        tabs.setProperty("_i18n_tabs_sources", sources)
+    for index, source in enumerate(sources):
+        translated = tr(str(source))
+        if tabs.tabText(index) != translated:
+            tabs.setTabText(index, translated)
+
+
+def retranslate_widgets(root):
+    """Translate static widget texts, keeping English source strings."""
+    if root is None:
+        return
+    widgets = []
+    if isinstance(root, QWidget):
+        widgets.append(root)
+    if hasattr(root, "findChildren"):
+        widgets.extend(root.findChildren(QWidget))
+    for widget in widgets:
+        if isinstance(widget, QLabel) and not widget.property("i18nDynamic"):
+            _translate_property(
+                widget, "_i18n_label", widget.text(), widget.setText)
+        if isinstance(widget, QAbstractButton):
+            _translate_property(
+                widget, "_i18n_button", widget.text(), widget.setText)
+        if isinstance(widget, QGroupBox):
+            _translate_property(
+                widget, "_i18n_group", widget.title(), widget.setTitle)
+        if isinstance(widget, QTabWidget):
+            _translate_tabs(widget)
+        if isinstance(widget, QTableWidget):
+            for column in range(widget.columnCount()):
+                item = widget.horizontalHeaderItem(column)
+                if item is not None:
+                    _translate_table_header(item)
+        if isinstance(widget, QLineEdit):
+            _translate_property(
+                widget, "_i18n_placeholder",
+                widget.placeholderText(), widget.setPlaceholderText)
+        if isinstance(widget, QMenu):
+            for action in widget.actions():
+                _translate_property(
+                    action, "_i18n_action", action.text(), action.setText)
+        _translate_property(
+            widget, "_i18n_tooltip", widget.toolTip(), widget.setToolTip)
+        if widget.isWindow():
+            _translate_property(
+                widget, "_i18n_window",
+                widget.windowTitle(), widget.setWindowTitle)
+
+
+def retranslate_windows():
+    for widget in QApplication.topLevelWidgets():
+        if widget.isVisible():
+            retranslate_widgets(widget)
+
+
+class RetranslateFilter(QObject):
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Type.Show
+                and isinstance(obj, QWidget)
+                and (obj.isWindow() or isinstance(obj, QMenu))):
+            retranslate_widgets(obj)
+        return False
 
 AUTH_ERROR_CODES = frozenset((106, 203, 204, 205))
 TIMEOUT_ERROR_CODES = frozenset((108,))
@@ -2877,7 +2988,7 @@ class DeviceTableModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.COLUMNS[section][0]
+            return tr(self.COLUMNS[section][0])
         return None
 
     def flags(self, index):
@@ -6668,6 +6779,7 @@ class MainWindow(QMainWindow):
         self.search_button.toggled.connect(self._toggle_search)
 
         self.status_label = QLabel(self._refresh_status_text())
+        self.status_label.setProperty("i18nDynamic", True)
         self.status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse |
             Qt.TextInteractionFlag.TextSelectableByKeyboard)
@@ -7063,33 +7175,72 @@ class MainWindow(QMainWindow):
 
         self.settings_timeout_spin = QSpinBox()
         self.settings_timeout_spin.setRange(1, 600)
-        self.settings_timeout_spin.setValue(5)
         self.settings_timeout_spin.setSuffix(" s")
-        self.settings_probe_label = QLabel("Probes per search: at least 3")
+        saved_timeout = QSettings("xmdm3", "xmdms").value(
+            "search_timeout", 5, type=int)
+        self.settings_timeout_spin.setValue(
+            min(max(int(saved_timeout or 5), 1), 600))
+        self.settings_attempts_spin = QSpinBox()
+        self.settings_attempts_spin.setRange(3, 100)
+        saved_attempts = QSettings("xmdm3", "xmdms").value(
+            "search_attempts", 3, type=int)
+        self.settings_attempts_spin.setValue(
+            min(max(int(saved_attempts or 3), 3), 100))
         self.settings_theme_combo = QComboBox()
-        self.settings_theme_combo.addItems(["Auto", "Light", "Dark"])
-        self.settings_theme_combo.currentTextChanged.connect(self._theme_changed)
+        for label, code in (("Auto", "auto"), ("Light", "light"),
+                            ("Dark", "dark")):
+            self.settings_theme_combo.addItem(tr(label), code)
+        self.settings_theme_combo.currentIndexChanged.connect(
+            self._theme_changed)
         self.settings_passwords_combo = QComboBox()
-        self.settings_passwords_combo.addItems(["Show", "Hide"])
-        self.settings_passwords_combo.setCurrentText(
-            "Show" if passwords_visible() else "Hide")
-        self.settings_passwords_combo.currentTextChanged.connect(
+        self.settings_passwords_combo.addItem(tr("Show"), True)
+        self.settings_passwords_combo.addItem(tr("Hide"), False)
+        password_index = self.settings_passwords_combo.findData(
+            bool(passwords_visible()))
+        if password_index >= 0:
+            self.settings_passwords_combo.setCurrentIndex(password_index)
+        self.settings_passwords_combo.currentIndexChanged.connect(
             self._passwords_changed)
+        self.settings_language_combo = QComboBox()
+        self.settings_language_combo.addItem(tr("Auto"), "auto")
+        self.settings_language_combo.addItem(tr("English"), "en")
+        self.settings_language_combo.addItem("Русский", "ru")
+        saved_language = str(QSettings("xmdm3", "xmdms").value(
+            "language", "auto", type=str) or "auto").strip().lower()
+        language_index = self.settings_language_combo.findData(saved_language)
+        if language_index < 0:
+            language_index = 0
+        self.settings_language_combo.blockSignals(True)
+        self.settings_language_combo.setCurrentIndex(language_index)
+        self.settings_language_combo.blockSignals(False)
+        self.settings_language_combo.currentIndexChanged.connect(
+            self._language_changed)
+        self.settings_timeout_spin.valueChanged.connect(
+            lambda value: self._save_setting(
+                "search_timeout", int(value)))
+        self.settings_attempts_spin.valueChanged.connect(
+            lambda value: self._save_setting(
+                "search_attempts", int(value)))
         settings_layout = QGridLayout()
         settings_layout.addWidget(QLabel("Search timeout:"), 0, 0)
         settings_layout.addWidget(self.settings_timeout_spin, 0, 1)
-        settings_layout.addWidget(self.settings_probe_label, 1, 0, 1, 2)
+        settings_layout.addWidget(QLabel("Search attempts:"), 1, 0)
+        settings_layout.addWidget(self.settings_attempts_spin, 1, 1)
         settings_layout.addWidget(QLabel("Theme:"), 2, 0)
         settings_layout.addWidget(self.settings_theme_combo, 2, 1)
         settings_layout.addWidget(QLabel("Passwords:"), 3, 0)
         settings_layout.addWidget(self.settings_passwords_combo, 3, 1)
-        settings_layout.setRowStretch(4, 1)
+        settings_layout.addWidget(QLabel("Language:"), 4, 0)
+        settings_layout.addWidget(self.settings_language_combo, 4, 1)
+        settings_layout.setRowStretch(5, 1)
         settings_panel = QWidget()
         settings_panel.setLayout(settings_layout)
         self._settings_panel = settings_panel
         saved_theme = str(QSettings("xmdm3", "xmdms").value(
-            "theme", "auto") or "auto").capitalize()
-        index = self.settings_theme_combo.findText(saved_theme)
+            "theme", "auto") or "auto").strip().lower()
+        index = self.settings_theme_combo.findData(saved_theme)
+        if index < 0:
+            index = self.settings_theme_combo.findData("auto")
         if index >= 0:
             self.settings_theme_combo.blockSignals(True)
             self.settings_theme_combo.setCurrentIndex(index)
@@ -7771,7 +7922,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(serial_panel, "RS232/485/PTZ")
 
         self.users_table = QTableWidget(0, 3)
-        self.users_table.setHorizontalHeaderLabels(("No", "Name", "Group"))
+        self.users_table.setHorizontalHeaderLabels(("#", "Name", "Group"))
         install_copy_menu(self.users_table)
         self.users_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.users_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -7787,7 +7938,7 @@ class MainWindow(QMainWindow):
             + self.users_table.frameWidth() * 2 + 2)
 
         self.groups_table = QTableWidget(0, 2)
-        self.groups_table.setHorizontalHeaderLabels(("No", "Group"))
+        self.groups_table.setHorizontalHeaderLabels(("#", "Group"))
         install_copy_menu(self.groups_table)
         self.groups_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.groups_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -7869,12 +8020,13 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.tabs, 1)
         right_layout.addLayout(bottom_bar)
 
+        right_panel.setFixedWidth(470)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(table_panel)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        splitter.setSizes([900, 360])
+        splitter.setSizes([900, 470])
 
         layout = QVBoxLayout()
         layout.addLayout(controls)
@@ -7887,11 +8039,17 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.setSizeGripEnabled(False)
         self.video_status_label = QLabel("")
+        self.video_status_label.setProperty("i18nDynamic", True)
         self.video_status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse |
             Qt.TextInteractionFlag.TextSelectableByKeyboard)
-        self.connection_label = QLabel("Disconnected")
+        self.connection_label = QLabel(tr("Disconnected"))
+        self.connection_label.setProperty(
+            "_i18n_label_source", "Disconnected")
+        self.connection_label.setProperty(
+            "_i18n_label_last", tr("Disconnected"))
         self.fetch_label = QLabel("")
+        self.fetch_label.setProperty("i18nDynamic", True)
         for label in (self.fetch_label, self.status_label, self.video_status_label):
             label.setSizePolicy(
                 QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -7926,9 +8084,12 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self._disable_device_tabs()
         load_private_extension(self)
+        retranslate_widgets(self)
+        self._update_language_combo_labels()
+        self._fit_system_buttons()
 
     def _message(self, text):
-        self.fetch_label.setText(text)
+        self.fetch_label.setText(tr(text))
 
     def _on_video_status(self, text):
         self.video_status_label.setText(text)
@@ -7937,16 +8098,19 @@ class MainWindow(QMainWindow):
 
     def _refresh_status_text(self):
         count = self.model.rowCount()
-        if self._thread is not None and self._thread.isRunning():
-            return "%s — %d device(s)" % (self._status_text, count)
-        return "%s — %d device(s)" % (self._idle_text, count)
+        base = (self._status_text if self._thread is not None
+                and self._thread.isRunning() else self._idle_text)
+        return "%s — %d %s" % (tr(base), count, tr("device(s)"))
 
     def _set_status(self, text):
         self._status_text = text
         self.status_label.setText(self._refresh_status_text())
 
     def _toggle_search(self, checked):
-        self.search_button.setText("Stop" if checked else "Search")
+        source = "Stop" if checked else "Search"
+        self.search_button.setProperty("_i18n_button_source", source)
+        self.search_button.setProperty("_i18n_button_last", tr(source))
+        self.search_button.setText(tr(source))
         self.interface_combo.setEnabled(not checked)
         if checked:
             self._start_search()
@@ -7959,7 +8123,8 @@ class MainWindow(QMainWindow):
             return
         thread = DiscoveryThread(
             interface["ip"], interface["broadcast"],
-            duration=self.settings_timeout_spin.value(), parent=self)
+            duration=self.settings_timeout_spin.value(),
+            min_probes=self.settings_attempts_spin.value(), parent=self)
         thread.device_found.connect(self._on_device_found)
         thread.status_changed.connect(self._set_status)
         thread.failed.connect(self._on_search_failed)
@@ -8605,6 +8770,11 @@ class MainWindow(QMainWindow):
                 return device
         return None
 
+    def _set_connection_text(self, source):
+        self.connection_label.setProperty("_i18n_label_source", source)
+        self.connection_label.setProperty("_i18n_label_last", tr(source))
+        self.connection_label.setText(tr(source))
+
     def _drop_connection(self, message=""):
         identity = self._connected_identity
         if identity is None:
@@ -8617,7 +8787,7 @@ class MainWindow(QMainWindow):
         self._fetched_identity = None
         self._fetched_keys = set()
         self._pending_fetch_keys = set()
-        self.connection_label.setText("Disconnected")
+        self._set_connection_text("Disconnected")
         self._sync_selection_state()
         if message:
             self._message(message)
@@ -8734,24 +8904,81 @@ class MainWindow(QMainWindow):
     def _on_system_connected(self, name, thread=None):
         if thread is not None and thread is not self._netip_thread:
             return
-        self.connection_label.setText("Connected: %s" % name)
+        self._set_connection_text("Connected: %s" % name)
         if self._connect_pending is not None:
             self.model.set_connected(self._connect_pending, True)
             self._connect_pending = None
         self._update_upgrade_controls()
 
     def _on_system_progress(self, text):
-        self.fetch_label.setText(text)
+        self.fetch_label.setText(tr(text))
 
-    def _theme_changed(self, text):
+    @staticmethod
+    def _save_setting(key, value):
         settings = QSettings("xmdm3", "xmdms")
-        settings.setValue("theme", str(text).strip().lower())
-        apply_theme(QApplication.instance(), text)
+        settings.setValue(key, value)
+        settings.sync()
 
-    def _passwords_changed(self, text):
-        visible = str(text).strip().lower() != "hide"
-        QSettings("xmdm3", "xmdms").setValue("show_passwords", visible)
+    def _theme_changed(self, *_):
+        code = str(self.settings_theme_combo.currentData() or "auto")
+        self._save_setting("theme", code)
+        apply_theme(QApplication.instance(), code)
+
+    def _passwords_changed(self, *_):
+        visible = bool(self.settings_passwords_combo.currentData())
+        self._save_setting("show_passwords", visible)
         apply_password_visibility(visible)
+
+    def _language_changed(self, *_):
+        setting = str(self.settings_language_combo.currentData() or "auto")
+        self._save_setting("language", setting)
+        set_language(resolve_language(setting))
+        retranslate_windows()
+        self._update_language_combo_labels()
+        self._fit_system_buttons()
+        self.model.headerDataChanged.emit(
+            Qt.Orientation.Horizontal, 0, self.model.columnCount() - 1)
+        self.status_label.setText(self._refresh_status_text())
+
+    def _update_language_combo_labels(self):
+        theme = {"auto": tr("Auto"), "light": tr("Light"), "dark": tr("Dark")}
+        for index in range(self.settings_theme_combo.count()):
+            code = self.settings_theme_combo.itemData(index)
+            if code in theme:
+                self.settings_theme_combo.setItemText(index, theme[code])
+        passwords = {True: tr("Show"), False: tr("Hide")}
+        for index in range(self.settings_passwords_combo.count()):
+            code = bool(self.settings_passwords_combo.itemData(index))
+            if code in passwords:
+                self.settings_passwords_combo.setItemText(
+                    index, passwords[code])
+        labels = {"auto": tr("Auto"), "en": tr("English"),
+                  "ru": tr("Russian")}
+        for index in range(self.settings_language_combo.count()):
+            code = self.settings_language_combo.itemData(index)
+            if code in labels:
+                self.settings_language_combo.setItemText(index, labels[code])
+
+    def _fit_system_buttons(self):
+        buttons = (
+            self.system_import_button, self.system_export_button,
+            self.system_reset_button, self.system_logs_button,
+            self.system_erase_logs_button, self.system_recovery_button,
+            self.system_dump_button, self.system_open_dir_button)
+        width = max(84, max(button.sizeHint().width()
+                            for button in buttons) + 10)
+        for button in buttons:
+            button.setMinimumWidth(width)
+            button.setMaximumWidth(width)
+        grid = getattr(self, "system_buttons_grid", None)
+        if grid is not None:
+            for index in range(grid.count()):
+                widget = grid.itemAt(index).widget()
+                if isinstance(widget, QPushButton):
+                    widget.setMinimumWidth(width)
+                    widget.setMaximumWidth(width)
+            grid.setColumnMinimumWidth(0, width)
+            grid.invalidate()
 
     def _save_current_tab(self):
         index = self.tabs.currentIndex()
@@ -10726,7 +10953,7 @@ class MainWindow(QMainWindow):
             if self._connected_identity == self._connect_pending:
                 self._connected_identity = None
             self._connect_pending = None
-            self.connection_label.setText("Disconnected")
+            self._set_connection_text("Disconnected")
         self._fetch_in_progress = False
         self._system_error = True
         self._message("NetIP error: %s" % text)
@@ -11513,6 +11740,9 @@ def main():
     app.setApplicationName("XMDMS")
     app.setWindowIcon(app_icon())
     settings = QSettings("xmdm3", "xmdms")
+    load_language()
+    retranslate_filter = RetranslateFilter(app)
+    app.installEventFilter(retranslate_filter)
     apply_theme(app, settings.value("theme", "auto"))
     install_query_logger()
     window = MainWindow()
