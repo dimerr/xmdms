@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import zipfile
 from collections import deque
 from datetime import datetime, timedelta
@@ -71,6 +73,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -81,6 +84,7 @@ from PySide6.QtWidgets import (
     QStyleOptionButton,
     QTableView,
     QTableWidget,
+    QTextBrowser,
     QTableWidgetItem,
     QTabWidget,
     QTreeWidget,
@@ -99,6 +103,50 @@ from i18n import (
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+GITHUB_REPO = "dimerr/xmdms"
+GITHUB_PROFILE = "https://github.com/dimerr"
+BASE_VERSION = "1.0"
+
+
+def _detect_build_info():
+    # A source checkout always reflects its own HEAD; build_info.py is for
+    # frozen builds (or source archives) where .git is not available.
+    if os.path.isdir(os.path.join(HERE, ".git")):
+        try:
+            count = subprocess.check_output(
+                ["git", "rev-list", "--count", "HEAD"],
+                cwd=HERE, text=True, timeout=3).strip()
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=HERE, text=True, timeout=3).strip()
+            date = subprocess.check_output(
+                ["git", "show", "-s", "--format=%cs", "HEAD"],
+                cwd=HERE, text=True, timeout=3).strip()
+            timestamp = subprocess.check_output(
+                ["git", "show", "-s", "--format=%cI", "HEAD"],
+                cwd=HERE, text=True, timeout=3).strip()
+            if count.isdigit():
+                return ("%s.%d" % (BASE_VERSION, int(count)), commit, date,
+                        timestamp)
+        except Exception:
+            pass
+    try:
+        import build_info
+        version = str(getattr(build_info, "VERSION", "") or "").strip()
+        if version:
+            return (
+                version,
+                str(getattr(build_info, "COMMIT", "") or "").strip(),
+                str(getattr(build_info, "BUILD_DATE", "") or "").strip(),
+                str(getattr(build_info, "COMMIT_DATE", "") or "").strip(),
+            )
+    except ImportError:
+        pass
+    return "%s.0" % BASE_VERSION, "", "", ""
+
+
+APP_VERSION, BUILD_COMMIT, BUILD_DATE, BUILD_TIMESTAMP = _detect_build_info()
 
 try:
     import psutil
@@ -2950,6 +2998,113 @@ class NetipVideoThread(QThread):
         if not self._stop:
             self.failed.emit("Stream ended")
         return camera
+
+
+def version_key(value):
+    parts = [int(part) for part in re.findall(r"\d+", str(value or ""))[:4]]
+    while len(parts) < 4:
+        parts.append(0)
+    return tuple(parts)
+
+
+def format_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(
+            text.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except ValueError:
+        return text
+
+
+def remote_is_newer(remote, local):
+    """Compare a GitHub timestamp with the local commit/build timestamp."""
+    remote = str(remote or "").strip()
+    local = str(local or "").strip()
+    if not remote or not local:
+        return False
+    if len(local) > 10:
+        try:
+            remote_dt = datetime.fromisoformat(remote.replace("Z", "+00:00"))
+            local_dt = datetime.fromisoformat(local.replace("Z", "+00:00"))
+            return remote_dt > local_dt
+        except ValueError:
+            pass
+    return format_date(remote) > format_date(local)
+
+
+class ReleaseCheckThread(QThread):
+    """Fetch the latest GitHub release, or the latest commit as a fallback."""
+
+    result = Signal(dict)
+    error = Signal(str)
+    API = "https://api.github.com/repos/%s" % GITHUB_REPO
+    HEADERS = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "XMDMS/%s" % APP_VERSION,
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    def _get(self, path):
+        request = urllib.request.Request(self.API + path, headers=self.HEADERS)
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _latest_commit(self):
+        last_error = None
+        for branch in ("main", "master"):
+            try:
+                data = self._get("/commits/%s" % branch)
+                commit = data.get("commit") if isinstance(data, dict) else {}
+                message = commit.get("message") if isinstance(commit, dict) else ""
+                author = commit.get("author") if isinstance(commit, dict) else {}
+                return {
+                    "kind": "commit",
+                    "branch": branch,
+                    "sha": str(data.get("sha") or ""),
+                    "message": str(message or ""),
+                    "date": str(author.get("date") or ""),
+                    "url": str(data.get("html_url") or ""),
+                }
+            except urllib.error.HTTPError as error:
+                last_error = error
+                if error.code != 404:
+                    raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No repository commits found")
+
+    def run(self):
+        try:
+            try:
+                data = self._get("/releases/latest")
+            except urllib.error.HTTPError as error:
+                if error.code != 404:
+                    raise
+                data = None
+            if isinstance(data, dict) and data.get("tag_name"):
+                self.result.emit({
+                    "kind": "release",
+                    "tag": str(data.get("tag_name") or ""),
+                    "name": str(data.get("name") or ""),
+                    "body": str(data.get("body") or ""),
+                    "date": str(data.get("published_at") or ""),
+                    "url": str(data.get("html_url") or ""),
+                })
+                return
+            self.result.emit(self._latest_commit())
+        except urllib.error.HTTPError as error:
+            if error.code in (403, 429):
+                self.error.emit("GitHub API rate limit reached")
+            elif error.code == 404:
+                self.error.emit("No releases or commits found")
+            else:
+                self.error.emit("GitHub API error: HTTP %s" % error.code)
+        except urllib.error.URLError as error:
+            self.error.emit("Network error: %s" % (error.reason or error))
+        except Exception as error:
+            self.error.emit("%s: %s" % (type(error).__name__, error))
 
 
 class DeviceTableModel(QAbstractTableModel):
@@ -6705,6 +6860,9 @@ class MainWindow(QMainWindow):
         self._pass_done = 0
         self._pass_failed = 0
         self._probe_thread = None
+        self._release_thread = None
+        self._updates_checked = False
+        self._about_state = ("idle", None)
         self._netip_thread = None
         self._network_thread = None
         self._pending_network = None
@@ -7233,9 +7391,57 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(QLabel("Language:"), 4, 0)
         settings_layout.addWidget(self.settings_language_combo, 4, 1)
         settings_layout.setRowStretch(5, 1)
+
+        about_group = QGroupBox("About")
+        about_group.setStyleSheet(GROUP_BOX_STYLE)
+        self.about_group = about_group
+        about_layout = QVBoxLayout(about_group)
+        about_layout.setSpacing(4)
+        version_row = QHBoxLayout()
+        self.about_version_label = QLabel(
+            "XMDMS %s%s" % (
+                APP_VERSION,
+                " (%s)" % BUILD_COMMIT if BUILD_COMMIT else ""))
+        if BUILD_DATE:
+            self.about_version_label.setToolTip(
+                "Build date: %s" % BUILD_DATE)
+        self.about_check_button = QPushButton("Check for updates")
+        self.about_check_button.clicked.connect(self._check_updates)
+        version_row.addWidget(self.about_version_label)
+        version_row.addStretch(1)
+        version_row.addWidget(self.about_check_button)
+        about_layout.addLayout(version_row)
+        self.about_status_label = QLabel(tr("Not checked"))
+        self.about_status_label.setProperty("i18nDynamic", True)
+        self.about_status_label.setWordWrap(True)
+        about_layout.addWidget(self.about_status_label)
+        self.about_notes = QTextBrowser()
+        self.about_notes.setOpenExternalLinks(True)
+        self.about_notes.setFixedHeight(170)
+        self.about_notes.setPlaceholderText(tr("No release notes."))
+        about_layout.addWidget(self.about_notes)
+        year = datetime.now().year
+        self.about_copyright = QLabel(
+            'Copyright %d <a href="%s">@dimerr</a>' % (year, GITHUB_PROFILE))
+        self.about_copyright.setOpenExternalLinks(True)
+        self.about_copyright.setTextFormat(Qt.TextFormat.RichText)
+        self.about_copyright.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        about_layout.addWidget(self.about_copyright)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        settings_layout.addWidget(separator, 6, 0, 1, 2)
+        settings_layout.addWidget(about_group, 7, 0, 1, 2)
         settings_panel = QWidget()
         settings_panel.setLayout(settings_layout)
         self._settings_panel = settings_panel
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        settings_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        settings_scroll.setWidget(settings_panel)
+        self._settings_scroll = settings_scroll
         saved_theme = str(QSettings("xmdm3", "xmdms").value(
             "theme", "auto") or "auto").strip().lower()
         index = self.settings_theme_combo.findData(saved_theme)
@@ -8003,7 +8209,7 @@ class MainWindow(QMainWindow):
         users_panel = QWidget()
         users_panel.setLayout(users_layout)
         self.tabs.addTab(users_panel, "Users")
-        self.tabs.addTab(settings_panel, "Settings")
+        self.tabs.addTab(settings_scroll, "Settings")
 
         self.save_button = QPushButton("Save")
         self.save_button.clicked.connect(self._save_current_tab)
@@ -8082,6 +8288,7 @@ class MainWindow(QMainWindow):
         self.video_panel.notice.connect(self._message)
         self.video_panel.lost.connect(self._on_video_lost)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.currentChanged.connect(self._on_settings_tab)
         self._disable_device_tabs()
         load_private_extension(self)
         retranslate_widgets(self)
@@ -8542,7 +8749,8 @@ class MainWindow(QMainWindow):
         widgets = []
         for index in range(self.tabs.count()):
             panel = self.tabs.widget(index)
-            if panel is getattr(self, "_settings_panel", None):
+            if panel in (getattr(self, "_settings_scroll", None),
+                         getattr(self, "_settings_panel", None)):
                 continue
             for cls in (QLineEdit, QComboBox, QCheckBox, QSpinBox, QPushButton,
                         QTableWidget):
@@ -8612,7 +8820,8 @@ class MainWindow(QMainWindow):
         self._age_runtime = None
         for index in range(self.tabs.count()):
             panel = self.tabs.widget(index)
-            if panel is getattr(self, "_settings_panel", None):
+            if panel in (getattr(self, "_settings_scroll", None),
+                         getattr(self, "_settings_panel", None)):
                 continue
             for widget in panel.findChildren(QWidget):
                 widget.blockSignals(True)
@@ -8929,11 +9138,107 @@ class MainWindow(QMainWindow):
         self._save_setting("show_passwords", visible)
         apply_password_visibility(visible)
 
+    def _on_settings_tab(self, index):
+        if (index == self.tabs.indexOf(self._settings_scroll)
+                and not self._updates_checked):
+            self._updates_checked = True
+            self._check_updates()
+
+    def _check_updates(self):
+        if self._release_thread is not None:
+            return
+        self._set_about_state("checking")
+        self.about_check_button.setEnabled(False)
+        thread = ReleaseCheckThread(self)
+        thread.result.connect(self._on_update_result)
+        thread.error.connect(self._on_update_error)
+        thread.finished.connect(self._release_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._release_thread = thread
+        thread.start()
+
+    def _release_finished(self):
+        self._release_thread = None
+        self.about_check_button.setEnabled(True)
+
+    def _set_about_state(self, kind, payload=None):
+        self._about_state = (kind, payload)
+        self._render_about_state()
+
+    def _render_about_state(self):
+        kind, payload = self._about_state
+        if kind == "checking":
+            self.about_status_label.setText(tr("Checking for updates..."))
+        elif kind == "error":
+            self.about_status_label.setText(
+                tr("Update check failed: ") + tr(payload))
+        elif kind == "result":
+            self._render_update_result(payload)
+        else:
+            self.about_status_label.setText(tr("Not checked"))
+
+    def _on_update_error(self, text):
+        self._set_about_state("error", text)
+
+    def _on_update_result(self, data):
+        self._set_about_state("result", data)
+
+    def _render_update_result(self, data):
+        kind = data.get("kind") if isinstance(data, dict) else None
+        if kind == "release":
+            tag = str(data.get("tag") or "")
+            title = str(data.get("name") or tag)
+            if version_key(tag) > version_key(APP_VERSION):
+                status = "%s %s (%s %s)" % (
+                    tr("Update available:"), tag,
+                    tr("current"), APP_VERSION)
+            else:
+                status = "%s %s" % (tr("Up to date — latest"), tag)
+            self.about_status_label.setText(status)
+            body = str(data.get("body") or "").strip()
+            if not body:
+                body = tr("No release notes.")
+            markdown = "## %s\n\n%s" % (title, body)
+            date = format_date(data.get("date"))
+            if date:
+                markdown += "\n\n_%s_" % date
+            self.about_notes.setMarkdown(markdown)
+            url = str(data.get("url") or "")
+            self.about_notes.setToolTip(url)
+        elif kind == "commit":
+            sha = str(data.get("sha") or "")
+            short = sha[:7]
+            branch = str(data.get("branch") or "main")
+            if BUILD_COMMIT and sha.lower().startswith(
+                    BUILD_COMMIT.lower()):
+                status = "%s %s" % (tr("Up to date — latest commit"), short)
+            elif BUILD_COMMIT and remote_is_newer(
+                    data.get("date"), BUILD_TIMESTAMP or BUILD_DATE):
+                status = "%s %s (%s)" % (
+                    tr("New commits available on"), branch, short)
+            elif BUILD_COMMIT:
+                status = "%s %s" % (tr("Up to date — latest commit"), short)
+            else:
+                status = "%s %s" % (tr("Latest commit:"), short or "?")
+            self.about_status_label.setText(status)
+            message = str(data.get("message") or "").strip()
+            if not message:
+                message = tr("No commit message.")
+            details = "%s\n\n%s" % (short, message)
+            date = format_date(data.get("date"))
+            if date:
+                details += "\n%s" % date
+            self.about_notes.setPlainText(details)
+            url = str(data.get("url") or "")
+            self.about_notes.setToolTip(url)
+
     def _language_changed(self, *_):
         setting = str(self.settings_language_combo.currentData() or "auto")
         self._save_setting("language", setting)
         set_language(resolve_language(setting))
         retranslate_windows()
+        self.about_notes.setPlaceholderText(tr("No release notes."))
+        self._render_about_state()
         self._update_language_combo_labels()
         self._fit_system_buttons()
         self.model.headerDataChanged.emit(
@@ -11700,6 +12005,10 @@ class MainWindow(QMainWindow):
         self._probe_thread = None
         if probe_thread is not None:
             probe_thread.wait(4000)
+        release_thread = self._release_thread
+        self._release_thread = None
+        if release_thread is not None:
+            release_thread.wait(6000)
         netip_thread = self._netip_thread
         self._netip_thread = None
         if netip_thread is not None:

@@ -10,6 +10,7 @@ call .build\Scripts\activate.bat || goto :error
 python -m pip install --upgrade pip || goto :error
 pip install -r requirements.txt pyinstaller || goto :error
 python tools\make_icon.py || goto :error
+python tools\make_build_info.py || goto :error
 pyinstaller --noconfirm xmdms.spec || goto :error
 
 echo.

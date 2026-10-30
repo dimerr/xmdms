@@ -9,6 +9,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -23,6 +25,9 @@ jobs:
 
       - name: Generate icon
         run: python tools/make_icon.py
+
+      - name: Generate build info
+        run: python tools/make_build_info.py
 
       - name: Build
         run: pyinstaller --noconfirm xmdms.spec

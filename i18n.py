@@ -72,6 +72,20 @@ RU = {
     "Storage": "Хранилище",
     "Users": "Пользователи",
     "Settings": "Настройки",
+    "About": "О программе",
+    "Check for updates": "Проверить обновления",
+    "Not checked": "Не проверялось",
+    "Checking for updates...": "Проверка обновлений...",
+    "No release notes.": "Нет списка изменений.",
+    "No commit message.": "Нет сообщения коммита.",
+    "current": "текущая",
+    "Update available:": "Доступно обновление:",
+    "Up to date — latest": "Обновлений нет — последний",
+    "Up to date — latest commit": "Обновлений нет — последний коммит",
+    "New commits available on": "Новые коммиты в",
+    "Latest commit:": "Последний коммит:",
+    "GitHub API rate limit reached": "Достигнут лимит запросов GitHub API",
+    "No releases or commits found": "Релизы или коммиты не найдены",
 
     # Network
     "LAN": "LAN",
@@ -296,6 +310,15 @@ RU = {
 }
 
 PREFIXES = (
+    ("Update check failed: ", "Ошибка проверки обновлений: "),
+    ("GitHub API error: HTTP ", "Ошибка GitHub API: HTTP "),
+    ("Network error: ", "Ошибка сети: "),
+    ("Build date: ", "Дата сборки: "),
+    ("Update available: ", "Доступно обновление: "),
+    ("Up to date — latest commit", "Обновлений нет — последний коммит"),
+    ("Up to date — latest", "Обновлений нет — последний"),
+    ("New commits available on ", "Новые коммиты в "),
+    ("Latest commit: ", "Последний коммит: "),
     ("Digital channels — ", "Цифровые каналы — "),
     ("Change password — ", "Сменить пароль — "),
     ("Network settings — ", "Сетевые настройки — "),
