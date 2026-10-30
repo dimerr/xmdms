@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate xmdms.ico from the SVG embedded in xmdms.py (build-time only)."""
+"""Generate icon files for builds from the SVG embedded in xmdms.py."""
 import base64
 import os
 import struct
@@ -13,7 +13,8 @@ from PySide6.QtGui import QImage, QPainter
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 import xmdms  # noqa: E402
 
@@ -54,10 +55,17 @@ def main():
             "<BBBBHHII", value, value, 0, 0, 1, 32, len(png), offset)
         offset += len(png)
         data += png
-    out = os.path.join(ROOT, "xmdms.ico")
+    out = os.path.join(HERE, "xmdms.ico")
     with open(out, "wb") as handle:
         handle.write(header + bytes(directory) + bytes(data))
-    print("wrote %s (%d bytes)" % (out, len(header) + len(directory) + len(data)))
+    print("wrote %s (%d bytes)" % (
+        out, len(header) + len(directory) + len(data)))
+    if "--png" in sys.argv[1:]:
+        for size, name in ((256, "xmdms.png"), (1024, "xmdms-1024.png")):
+            path = os.path.join(HERE, name)
+            with open(path, "wb") as handle:
+                handle.write(render_png(renderer, size))
+            print("wrote %s" % path)
     return 0
 
 

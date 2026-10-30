@@ -4,6 +4,8 @@ __pycache__/
 build/
 dist/
 *.ico
+.packaging/*.png
+.packaging/*.icns
 cfgs/
 xmcloud*.py
 priv.py

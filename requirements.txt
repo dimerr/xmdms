@@ -10,5 +10,3 @@ python-dvr @ https://github.com/OpenIPC/python-dvr/archive/refs/heads/master.tar
 # Optional:
 #   av>=10          PyAV video-decoder fallback
 #   colorama>=0.4   required by xmcloud.py (cloud/RPS transport, not distributed)
-#
-# Build (Windows): pip install pyinstaller>=6.11   (see build_windows.bat)

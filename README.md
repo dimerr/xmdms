@@ -123,7 +123,7 @@ application. Windows users can use `py -3.12` instead of `python3`.
 PyInstaller cannot cross-compile; build on Windows (or let CI do it):
 
 ```bat
-build_windows.bat
+.packaging\build_windows.bat
 ```
 
 The script creates a virtual environment, installs dependencies, generates the
@@ -134,9 +134,8 @@ dist\xmdms\xmdms.exe
 ```
 
 Requirements: Windows and Python 3.12 with the `py` launcher. The GitHub
-Actions workflow
-(`.github/workflows/windows-build.yml`) runs the same steps on every push or
-manual dispatch and uploads `xmdms-windows-x64.zip`.
+Actions workflow (`.github/workflows/build-release.yml`) builds Windows, Linux
+and macOS on every push and publishes releases from `main`.
 
 ## Notes and limitations
 

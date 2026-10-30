@@ -1,0 +1,210 @@
+name: build-release
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.info.outputs.version }}
+      tag: ${{ steps.info.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: info
+        shell: bash
+        run: |
+          python .packaging/make_build_info.py
+          version=$(python -c "import build_info; print(build_info.VERSION)")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+  build_windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon
+        run: python .packaging/make_icon.py
+
+      - name: Generate build info
+        run: python .packaging/make_build_info.py
+
+      - name: Build
+        run: pyinstaller --noconfirm .packaging/xmdms.spec
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist/xmdms/* -DestinationPath xmdms-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xmdms-windows-x64
+          path: xmdms-windows-x64.zip
+          retention-days: 30
+
+  build_linux:
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxkbcommon-x11-0 \
+            libxcb-cursor0 libpulse0 libasound2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon
+        run: python .packaging/make_icon.py --png
+
+      - name: Generate build info
+        run: python .packaging/make_build_info.py
+
+      - name: Build
+        run: pyinstaller --noconfirm .packaging/xmdms.spec
+
+      - name: Get appimagetool
+        run: |
+          mkdir -p build
+          curl -fsSL -o build/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x build/appimagetool
+
+      - name: Package AppImage
+        run: bash .packaging/make_appimage.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xmdms-linux-x86_64
+          path: dist/xmdms-linux-x86_64.AppImage
+          retention-days: 30
+
+  build_macos:
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            artifact: xmdms-macos-arm64
+          - runner: macos-15-intel
+            artifact: xmdms-macos-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon
+        run: python .packaging/make_icon.py --png
+
+      - name: Generate macOS icon
+        run: bash .packaging/make_macos_icns.sh
+
+      - name: Generate build info
+        run: python .packaging/make_build_info.py
+
+      - name: Build
+        run: pyinstaller --noconfirm .packaging/xmdms.spec
+
+      - name: Package
+        run: ditto -c -k --keepParent dist/XMDMS.app "${{ matrix.artifact }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          retention-days: 30
+
+  release:
+    needs: [version, build_windows, build_linux, build_macos]
+    if: |
+      always() &&
+      needs.version.result == 'success' &&
+      needs.build_windows.result == 'success' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: xmdms-*
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(release-assets/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No release assets found." >&2
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --title "XMDMS $VERSION"
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "XMDMS $VERSION" \
+              --generate-notes
+          fi
