@@ -5,7 +5,8 @@ build/
 dist/
 *.ico
 cfgs/
-xmcloud.py
+xmcloud*.py
+priv.py
 Web/
 getencode.py
 .env

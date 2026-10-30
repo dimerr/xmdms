@@ -15,6 +15,8 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+import zipfile
 from collections import deque
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -99,6 +101,11 @@ try:
     from dvrip import DVRIPCam
 except ImportError:
     DVRIPCam = None
+
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
 
 try:
     from PySide6.QtMultimedia import (
@@ -239,11 +246,12 @@ TAB_FETCH_KEYS = (
                  "caps", "force_dhcp", "disable_xm_server", "nat", "ability",
                  "oemcfg")),
     ("System", ("system", "common", "general", "system_timezone", "languages",
-                "max_preview", "device_desc", "nat_info", "chn_status")),
+                "max_preview", "ability", "device_desc", "nat_info",
+                "chn_status")),
     ("Display", ("video_out", "gui_set", "vga_resolution", "ability", "device_desc")),
     ("Encode", ("system", "general", "chn_status", "encode_channels",
                 "encode_smart", "encode_ability", "av_encode")),
-    ("Camera", ("camera_param", "white_light")),
+    ("Camera", ("camera_param", "camera_ex_param", "white_light")),
     ("Storage", ("storage_info",)),
     ("RS232/485/PTZ", ("uart_comm", "uart_ptz", "uart_rs485", "com_protocol",
                        "ptz_protocol", "uart_protocol")),
@@ -256,6 +264,12 @@ CAMERA_FIELD_PATHS = {
     "ExposureLevel": ("ExposureParam", "Level"),
     "AutoGain": ("GainParam", "AutoGain"),
     "Gain": ("GainParam", "Gain"),
+}
+CAMERA_EX_FIELD_PATHS = {
+    "AutomaticAdjustment": (None, "AutomaticAdjustment"),
+    "Style": (None, "Style"),
+    "DWDR": ("BroadTrends", "AutoGain"),
+    "DWDRGain": ("BroadTrends", "Gain"),
 }
 WHITE_LIGHT_FIELD_PATHS = {
     "MoveTrigLevel": ("MoveTrigLight", "Level"),
@@ -536,6 +550,11 @@ def _import_cloud_patch():
     return module
 
 
+def cloud_patch_available():
+    """True when xmcloud.py sits next to the application."""
+    return os.path.isfile(os.path.join(HERE, CLOUD_PATCH_FILES[0]))
+
+
 def _cloud_dispatch(original, patched):
     def method(self, *args, **kwargs):
         if getattr(self, "_cloud_device", False):
@@ -578,6 +597,48 @@ def load_cloud_patch():
     install_query_logger()
     _cloud_patch = module
     return module
+
+
+def load_private_extension(window):
+    """Load the optional local ``priv.py`` next to the application.
+
+    The file is deliberately not imported statically: PyInstaller never
+    collects it, so it cannot leak into a public build.  It is also
+    gitignored and local-only.  ``priv.py`` must define
+    ``install(window, app)`` where ``app`` is this running module.
+    """
+    bases = []
+    try:
+        bases.append(window._app_dir())
+    except Exception:
+        pass
+    if HERE not in bases:
+        bases.append(HERE)
+    path = ""
+    for base in bases:
+        candidate = os.path.join(base, "priv.py")
+        if os.path.isfile(candidate):
+            path = candidate
+            break
+    if not path:
+        return
+    try:
+        spec = importlib.util.spec_from_file_location("xmdms_priv", path)
+        if spec is None or spec.loader is None:
+            raise ImportError("cannot load %s" % path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["xmdms_priv"] = module
+        spec.loader.exec_module(module)
+        install = getattr(module, "install", None)
+        if not callable(install):
+            raise RuntimeError("priv.py does not define install(window, app)")
+        install(window, sys.modules[__name__])
+    except Exception as error:
+        traceback.print_exc()
+        try:
+            window._message("Private extension error: %s" % error)
+        except Exception:
+            pass
 
 
 class QueryLogBus(QObject):
@@ -716,6 +777,172 @@ def port_value(edit, default):
         return int(edit.text().strip())
     except (TypeError, ValueError):
         return default
+
+
+LOGIN_PASSWORD_CODES = {
+    106: "wrong username or password",
+    203: "wrong password",
+}
+
+
+CONNECTION_ERROR_HINTS = (
+    "cannot connect", "login failed", "connection reset", "connection aborted",
+    "connection refused", "broken pipe", "timed out", "timeout", "socket",
+    "closed", "eof", "not connected", "nonetype",
+)
+
+PASSWORD_FIELD_PROPERTY = "xmdms_password_field"
+
+
+def passwords_visible():
+    """Whether password fields are shown as plain text (default: shown)."""
+    return QSettings("xmdm3", "xmdms").value(
+        "show_passwords", True, type=bool)
+
+
+def configure_password_edit(edit):
+    """Mark a QLineEdit as a password field and apply the current mode."""
+    edit.setProperty(PASSWORD_FIELD_PROPERTY, True)
+    edit.setEchoMode(
+        QLineEdit.EchoMode.Normal if passwords_visible()
+        else QLineEdit.EchoMode.Password)
+    return edit
+
+
+def apply_password_visibility(visible=None):
+    """Update every known password field, including open dialogs."""
+    if visible is None:
+        visible = passwords_visible()
+    mode = (QLineEdit.EchoMode.Normal if visible
+            else QLineEdit.EchoMode.Password)
+    for widget in QApplication.allWidgets():
+        if (isinstance(widget, QLineEdit)
+                and bool(widget.property(PASSWORD_FIELD_PROPERTY))):
+            widget.setEchoMode(mode)
+
+AUTH_ERROR_CODES = frozenset((106, 203, 204, 205))
+TIMEOUT_ERROR_CODES = frozenset((108,))
+AUTH_ERROR_HINTS = (
+    "wrong password", "password is incorrect", "wrong username or password",
+    "user is illegal", "user is locked",
+)
+TIMEOUT_ERROR_HINTS = (
+    "timed out", "timeout", "no response", "unreachable", "cannot connect",
+    "connection refused", "connection reset", "connection aborted",
+    "broken pipe", "socket", "closed", "eof", "not connected",
+)
+
+
+def is_connection_error(text):
+    """True when an error text means the NETIP socket/connection is gone."""
+    lowered = str(text or "").lower()
+    return any(hint in lowered for hint in CONNECTION_ERROR_HINTS)
+
+
+def login_failure_text(camera):
+    """Describe a failed NETIP login, flagging password errors explicitly."""
+    code = getattr(camera, "session", None)
+    if not isinstance(code, int):
+        return "Login failed"
+    if code in LOGIN_PASSWORD_CODES:
+        return "Login failed — %s (Ret=%d)" % (LOGIN_PASSWORD_CODES[code], code)
+    text = None
+    if DVRIPCam is not None:
+        codes = getattr(DVRIPCam, "CODES", None)
+        if isinstance(codes, dict):
+            text = codes.get(code)
+    if text:
+        return "Login failed: %s (Ret=%d)" % (text, code)
+    return "Login failed"
+
+
+UIMAGE_MAGIC = 0x27051956
+UIMAGE_HEADER_SIZE = 64
+DUMP_SIZE_STEPS = (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+
+
+def parse_uimage_header(data):
+    """Parse a U-Boot uImage header; None when the blob is not a uImage."""
+    if not data or len(data) < UIMAGE_HEADER_SIZE:
+        return None
+    (magic, _hcrc, timestamp, size, load, entry,
+     _dcrc) = struct.unpack(">IIIIIII", bytes(data[:28]))
+    if magic != UIMAGE_MAGIC:
+        return None
+    name = bytes(data[32:64]).split(b"\x00", 1)[0].decode(
+        "ascii", "replace").strip()
+    return {
+        "size": int(size),
+        "load": int(load),
+        "entry": int(entry),
+        "timestamp": int(timestamp),
+        "os": int(data[28]),
+        "arch": int(data[29]),
+        "type": int(data[30]),
+        "comp": int(data[31]),
+        "name": name,
+    }
+
+
+def tcp_reachable(address, port, timeout=3.0):
+    """Fast TCP reachability probe.
+
+    dvrip's connect() applies its timeout only after the blocking connect()
+    call, so unreachable hosts can stall for minutes; probe first.
+    """
+    if not address:
+        return False
+    try:
+        with socket.create_connection(
+                (address, int(port or 34567)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def table_cell_text(table, index):
+    """Displayed value of a table cell (item, cell widget or model data)."""
+    if index is None or not index.isValid():
+        return ""
+    widget = table.indexWidget(index)
+    if widget is not None:
+        if hasattr(widget, "currentText"):
+            return str(widget.currentText())
+        if hasattr(widget, "text"):
+            return str(widget.text())
+    if hasattr(table, "item"):
+        item = table.item(index.row(), index.column())
+        if item is not None:
+            if item.text():
+                return item.text()
+            if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                return "1" if item.checkState() == Qt.CheckState.Checked else "0"
+            return ""
+    value = table.model().data(index, Qt.ItemDataRole.DisplayRole)
+    if value in (None, ""):
+        state = table.model().data(index, Qt.ItemDataRole.CheckStateRole)
+        if state is not None:
+            return "1" if Qt.CheckState(state) == Qt.CheckState.Checked else "0"
+    return "" if value is None else str(value)
+
+
+def install_copy_menu(table, label="Copy"):
+    """Add a context menu that copies the clicked cell's value."""
+    table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+    def show_menu(point):
+        index = table.indexAt(point)
+        if not index.isValid():
+            return
+        text = table_cell_text(table, index)
+        menu = QMenu(table)
+        action = menu.addAction(label)
+        action.setEnabled(bool(text))
+        action.triggered.connect(
+            lambda: QApplication.clipboard().setText(text))
+        menu.exec(table.viewport().mapToGlobal(point))
+
+    table.customContextMenuRequested.connect(show_menu)
 
 
 def default_route_source_ip():
@@ -900,6 +1127,7 @@ def manual_device(address, port, username, password, cloud_id=None, rps=True):
         "ip": address,
         "cloud_id": cloud_id or "",
         "rps": bool(rps),
+        "no_md5": False,
         "tcp_port": int(port) if port else 34567,
         "username": username or "admin",
         "password": password or "",
@@ -922,7 +1150,7 @@ def manual_device(address, port, username, password, cloud_id=None, rps=True):
 
 def build_rtsp_url(device, username, password, channel, stream):
     user = quote(username or "", safe="")
-    secret = quote(password or "", safe="")
+    secret = quote(sofia_hash(password or ""), safe="")
     ip = device.get("ip") or ""
     return "rtsp://%s:%s@%s:554/user=%s_password=%s_channel=%d_stream=%d.sdp?real_stream" % (
         user, secret, ip, user, secret, channel, stream)
@@ -1231,12 +1459,14 @@ class NetipThread(QThread):
     connected = Signal(str)
 
     def __init__(self, action, address, username, password, cloud_id=None,
-                 rps=True, changes=None, port=34567, timeout=8.0, parent=None):
+                 rps=True, changes=None, port=34567, timeout=8.0, parent=None,
+                 no_md5=False):
         super().__init__(parent)
         self._action = action
         self._address = address
         self._username = username
         self._password = password
+        self._no_md5 = bool(no_md5)
         self._cloud_id = cloud_id or ""
         self._rps = bool(rps)
         self._changes = changes or {}
@@ -1263,6 +1493,8 @@ class NetipThread(QThread):
             address = self._cloud_id or self._address
             camera = DVRIPCam(address, user=self._username,
                               password=self._password, port=self._port)
+            if self._no_md5:
+                camera.hash_pass = self._password
             self._camera = camera
             if self._cloud_id:
                 load_cloud_patch()
@@ -1271,12 +1503,17 @@ class NetipThread(QThread):
                 else:
                     os.environ.pop("RPS", None)
                 camera._cloud_device = True
+            if not self._cloud_id and not tcp_reachable(self._address, self._port):
+                if not self._cancelled:
+                    self.failed.emit("Cannot connect to %s:%s (unreachable)" % (
+                        self._address, self._port))
+                return
             camera.connect(timeout=self._timeout)
             if self._cancelled:
                 return
             if not camera.login():
                 if not self._cancelled:
-                    self.failed.emit("Login failed")
+                    self.failed.emit(login_failure_text(camera))
                 return
             if not self._cancelled:
                 self.connected.emit(self._cloud_id or self._address)
@@ -1305,7 +1542,7 @@ class NetipThread(QThread):
                     return value
 
                 loop_keys = ("encode_channels", "encode_smart", "encode_ability",
-                             "camera_param", "white_light")
+                             "camera_param", "camera_ex_param", "white_light")
                 need_loop = any(want(name) for name in loop_keys)
                 need_channels = want("chn_status") or need_loop
                 system_info = None
@@ -1347,6 +1584,7 @@ class NetipThread(QThread):
                     encode_smart = []
                     encode_ability = []
                     camera_param = []
+                    camera_ex_param = []
                     white_light = []
                     for chn in range(dig_channels):
                         status = chn_status[chn] if chn < len(chn_status) else None
@@ -1357,6 +1595,7 @@ class NetipThread(QThread):
                             encode_smart.append(None)
                             encode_ability.append(None)
                             camera_param.append(None)
+                            camera_ex_param.append(None)
                             white_light.append(None)
                             continue
                         if want("encode_channels"):
@@ -1378,6 +1617,14 @@ class NetipThread(QThread):
                                     "Camera.Param.[%d]" % chn, 1042))
                             except Exception:
                                 camera_param.append(None)
+                        if want("camera_ex_param"):
+                            try:
+                                self.progress.emit(
+                                    "Fetching Camera.ParamEx.[%d]" % chn)
+                                camera_ex_param.append(camera.get_command(
+                                    "Camera.ParamEx.[%d]" % chn, 1042))
+                            except Exception:
+                                camera_ex_param.append(None)
                         if want("white_light"):
                             try:
                                 self.progress.emit(
@@ -1406,12 +1653,27 @@ class NetipThread(QThread):
                             else:
                                 encode_smart.append(None)
                     if not dig_channels:
+                        if want("encode_ability"):
+                            try:
+                                self.progress.emit("Fetching EncodeCapability")
+                                reply = camera.get_command("EncodeCapability", 1360)
+                                if (isinstance(reply, dict)
+                                        and reply.get("Ret") in (None, 100)):
+                                    encode_ability = [reply]
+                            except Exception:
+                                encode_ability = []
                         if want("camera_param"):
                             try:
                                 camera_param = [camera.get_command(
                                     "Camera.Param.[0]", 1042)]
                             except Exception:
                                 camera_param = [None]
+                        if want("camera_ex_param"):
+                            try:
+                                camera_ex_param = [camera.get_command(
+                                    "Camera.ParamEx.[0]", 1042)]
+                            except Exception:
+                                camera_ex_param = [None]
                         if want("white_light"):
                             try:
                                 white_light = [camera.get_command(
@@ -1441,6 +1703,8 @@ class NetipThread(QThread):
                         payload["encode_ability"] = encode_ability
                     if want("camera_param"):
                         payload["camera_param"] = camera_param
+                    if want("camera_ex_param"):
+                        payload["camera_ex_param"] = camera_ex_param
                     if want("white_light"):
                         payload["white_light"] = white_light
                 for name, command, code in (
@@ -1570,9 +1834,17 @@ class NetipThread(QThread):
                         "Media.DecodeParam", changes["decode_param"], 1040)
                 self.applied.emit(results)
                 return
+            if action == "wifi_scan":
+                self.fetched.emit({
+                    "wifi_scan": camera.get_command("WifiAP", 1020)})
+                return
             if action == "dig_set_ip":
                 reply = camera.send(1652, self._changes.get("payload") or {})
                 self.applied.emit({"OPDIGSetIP": reply})
+                return
+            if action == "snapshot":
+                channel = int(self._changes.get("channel") or 0)
+                self.fetched.emit({"snapshot": camera.snapshot(channel=channel)})
                 return
             if action == "local_search":
                 protocol = str(self._changes.get("protocol") or "NETIP").upper()
@@ -1880,6 +2152,11 @@ class NetipThread(QThread):
             for chn, config in camera_param:
                 command = "Camera.Param.[%d]" % chn
                 results[command] = camera.set_command(command, config, 1040)
+        camera_ex_param = changes.get("camera_ex_param")
+        if camera_ex_param:
+            for chn, config in camera_ex_param:
+                command = "Camera.ParamEx.[%d]" % chn
+                results[command] = camera.set_command(command, config, 1040)
         white_light = changes.get("white_light")
         if white_light:
             for command, config in white_light:
@@ -2032,6 +2309,105 @@ class MjpegDecoder(QObject):
         self.reset()
 
 
+class NetipSessionThread(QThread):
+    """Persistent NETIP session that notices when the connection drops.
+
+    Keeps one socket open and sends the protocol keepalive on schedule.  When
+    the socket dies (device rebooted, IP changed, cable pulled, WiFi lost) the
+    keepalive fails and ``lost`` is emitted so the UI can drop the connected
+    state instead of pretending to be connected forever.
+    """
+
+    lost = Signal(str)
+    ready = Signal(str)
+
+    def __init__(self, address, username, password, cloud_id="", rps=True,
+                 port=34567, interval=5.0, no_md5=False, parent=None):
+        super().__init__(parent)
+        self._address = address
+        self._username = username
+        self._password = password
+        self._no_md5 = bool(no_md5)
+        self._cloud_id = cloud_id or ""
+        self._rps = bool(rps)
+        self._port = int(port or 34567)
+        self._interval = max(3.0, float(interval))
+        self._stop = False
+        self._camera = None
+
+    def stop(self):
+        self._stop = True
+        camera = self._camera
+        if camera is not None:
+            try:
+                if camera.socket is not None:
+                    camera.socket.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+
+    def run(self):
+        camera = None
+        try:
+            address = self._cloud_id or self._address
+            camera = DVRIPCam(address, user=self._username,
+                              password=self._password, port=self._port)
+            if self._no_md5:
+                camera.hash_pass = self._password
+            if self._cloud_id:
+                load_cloud_patch()
+                if self._rps:
+                    os.environ["RPS"] = "1"
+                else:
+                    os.environ.pop("RPS", None)
+                camera._cloud_device = True
+            elif not tcp_reachable(self._address, self._port):
+                self.lost.emit("Cannot connect to %s:%s (unreachable)" % (
+                    self._address, self._port))
+                return
+            camera.connect(timeout=8.0)
+            if self._stop:
+                return
+            if not camera.login():
+                self.lost.emit(login_failure_text(camera))
+                return
+            self._camera = camera
+            try:
+                camera.alive.cancel()
+            except Exception:
+                pass
+            self.ready.emit(self._cloud_id or self._address)
+            while not self._stop:
+                deadline = time.monotonic() + self._interval
+                while not self._stop and time.monotonic() < deadline:
+                    time.sleep(0.2)
+                if self._stop:
+                    break
+                try:
+                    reply = camera.send(1006, {
+                        "Name": "KeepAlive",
+                        "SessionID": "0x%08X" % camera.session})
+                except Exception as error:
+                    if not self._stop:
+                        self.lost.emit("Connection lost: %s" % (error,))
+                    return
+                if self._stop:
+                    break
+                if (not isinstance(reply, dict)
+                        or reply.get("Ret") not in camera.OK_CODES):
+                    self.lost.emit("Connection lost (no keepalive reply)")
+                    return
+        except Exception as error:
+            if not self._stop:
+                self.lost.emit("%s: %s" % (type(error).__name__, error))
+        finally:
+            self._camera = None
+            if camera is not None:
+                try:
+                    camera.close()
+                except Exception:
+                    pass
+
+
 class NetipVideoThread(QThread):
     status = Signal(str)
     stats = Signal(str)
@@ -2041,11 +2417,12 @@ class NetipVideoThread(QThread):
 
     def __init__(self, address, username, password, sink, cloud_id="", rps=True,
                  port=34567, stream="Main", channel=0, parent=None,
-                 audio_sink=None):
+                 audio_sink=None, no_md5=False):
         super().__init__(parent)
         self._address = address
         self._username = username
         self._password = password
+        self._no_md5 = bool(no_md5)
         self._sink = sink
         self._audio_sink = audio_sink
         self._cloud_id = cloud_id or ""
@@ -2063,6 +2440,7 @@ class NetipVideoThread(QThread):
         self._last_seq = None
         self._packet_seq = None
         self._resync = False
+        self._socket_closed = False
         self._need_keyframe = True
         self._win_start = 0.0
         self._win_frames = 0
@@ -2131,17 +2509,13 @@ class NetipVideoThread(QThread):
 
     def stop(self):
         self._stop = True
-        camera = self._camera
-        if camera is not None:
-            try:
-                camera.stop_monitor()
-            except Exception:
-                pass
 
     def _open_camera(self):
         address = self._cloud_id or self._address
         camera = DVRIPCam(address, user=self._username,
                           password=self._password, port=self._port)
+        if self._no_md5:
+            camera.hash_pass = self._password
         if self._cloud_id:
             load_cloud_patch()
             if self._rps:
@@ -2149,9 +2523,12 @@ class NetipVideoThread(QThread):
             else:
                 os.environ.pop("RPS", None)
             camera._cloud_device = True
+        elif not tcp_reachable(self._address, self._port):
+            raise RuntimeError("Cannot connect to %s:%s (unreachable)" % (
+                self._address, self._port))
         camera.connect(timeout=8.0)
         if not camera.login():
-            raise RuntimeError("Login failed")
+            raise RuntimeError(login_failure_text(camera))
         camera.timeout = 5
         return camera
 
@@ -2203,6 +2580,10 @@ class NetipVideoThread(QThread):
             self._camera = None
             if camera is not None:
                 try:
+                    camera.stop_monitor()
+                except Exception:
+                    pass
+                try:
                     camera.close()
                 except Exception:
                     pass
@@ -2228,11 +2609,19 @@ class NetipVideoThread(QThread):
                     return None
                 continue
             except OSError:
+                if not self._stop:
+                    self._socket_closed = True
                 return None
             if not chunk:
+                if not self._stop:
+                    self._socket_closed = True
                 return None
             self._recv_buf.extend(chunk)
         return bytes(buf)
+
+    @staticmethod
+    def _is_jpeg_frame(frame):
+        return bool(frame) and bytes(frame[:2]) == b"\xff\xd8"
 
     @staticmethod
     def _is_frame_start(payload):
@@ -2345,7 +2734,7 @@ class NetipVideoThread(QThread):
                     meta["fps"] = fps
                     meta["width"] = width * 8
                     meta["height"] = height * 8
-                    meta["frame"] = "I"
+                    meta["frame"] = "I" if data_type == 0x1FC else "P"
                     meta["type"] = NetipVideoThread.MEDIA_TYPES.get(media & 0x0F)
                     frame_len = 16
                 elif data_type == 0x1FD:
@@ -2399,6 +2788,9 @@ class NetipVideoThread(QThread):
             if self._stop:
                 break
             if not frame:
+                if self._socket_closed and not self._stop:
+                    self.failed.emit("Connection lost — stream stopped")
+                    break
                 self._empty_reads += 1
                 if self._empty_reads == 3:
                     self.status.emit("No media data received (channel offline?)")
@@ -2413,6 +2805,9 @@ class NetipVideoThread(QThread):
             if self._need_keyframe:
                 if not codec:
                     continue
+                if (meta.get("frame") != "I" and codec != "jpeg"
+                        and not self._is_jpeg_frame(frame)):
+                    continue
                 self._need_keyframe = False
                 self._sink.restart()
                 self._win_start = 0.0
@@ -2422,10 +2817,12 @@ class NetipVideoThread(QThread):
             elif codec and self._sink.codec != codec:
                 self._sink.restart()
             data = bytes(frame)
+            keyframe = bool(isinstance(meta, dict)
+                            and meta.get("frame") == "I")
             if data[:2] == b"\xff\xd8":
-                self._sink.push_jpeg(data)
+                self._sink.push_jpeg(data, keyframe)
             else:
-                self._sink.feed(data, codec)
+                self._sink.feed(data, codec, keyframe)
             now = time.monotonic()
             if self._win_start == 0.0:
                 self._win_start = now
@@ -2829,20 +3226,35 @@ class AddDeviceDialog(QDialog):
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(34567)
+        self.port_spin.setMaximumWidth(80)
+        self.no_md5_check = QCheckBox("NOMD5")
+        self.no_md5_check.setToolTip(
+            "Send the password as-is instead of the MD5/sofia hash.")
         self.user_edit = QLineEdit("admin")
         self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        configure_password_edit(self.password_edit)
         self.cloud_edit = QLineEdit()
         self.cloud_edit.setPlaceholderText("SN, overrides IP")
         self.cloud_edit.textChanged.connect(self._cloud_changed)
         self.rps_check = QCheckBox("RPS")
         self.rps_check.setChecked(True)
+        if not cloud_patch_available():
+            note = "xmcloud.py not available — cloud/SN transport disabled"
+            self.cloud_edit.setEnabled(False)
+            self.rps_check.setEnabled(False)
+            self.cloud_edit.setToolTip(note)
+            self.rps_check.setToolTip(note)
 
         form = QGridLayout()
         form.addWidget(QLabel("IP address:"), 0, 0)
         form.addWidget(self.address_edit, 0, 1)
+        port_row = QHBoxLayout()
+        port_row.setContentsMargins(0, 0, 0, 0)
+        port_row.addWidget(self.port_spin)
+        port_row.addWidget(self.no_md5_check)
+        port_row.addStretch(1)
         form.addWidget(QLabel("Port:"), 1, 0)
-        form.addWidget(self.port_spin, 1, 1)
+        form.addLayout(port_row, 1, 1)
         form.addWidget(QLabel("Login:"), 2, 0)
         form.addWidget(self.user_edit, 2, 1)
         form.addWidget(QLabel("Password:"), 3, 0)
@@ -2862,6 +3274,9 @@ class AddDeviceDialog(QDialog):
         layout.addWidget(buttons)
 
     def _cloud_changed(self, text):
+        if not self.cloud_edit.isEnabled():
+            self.address_edit.setEnabled(True)
+            return
         self.address_edit.setEnabled(not text.strip())
 
     def set_user(self, user):
@@ -2873,6 +3288,7 @@ class AddDeviceDialog(QDialog):
     def set_values(self, device):
         self.address_edit.setValue(device.get("ip") or "")
         self.port_spin.setValue(int(device.get("tcp_port") or 34567))
+        self.no_md5_check.setChecked(bool(device.get("no_md5")))
         self.user_edit.setText(device.get("username") or "admin")
         self.password_edit.setText(device.get("password") or "")
         self.cloud_edit.setText(device.get("cloud_id") or "")
@@ -2896,6 +3312,9 @@ class AddDeviceDialog(QDialog):
 
     def rps(self):
         return self.rps_check.isChecked()
+
+    def no_md5(self):
+        return self.no_md5_check.isChecked()
 
 
 class AuthorityListWidget(QListWidget):
@@ -2922,9 +3341,9 @@ class UserDialog(QDialog):
         self.name_edit = QLineEdit()
         self.sharable_check = QCheckBox("Reuseable")
         self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        configure_password_edit(self.password_edit)
         self.confirm_edit = QLineEdit()
-        self.confirm_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        configure_password_edit(self.confirm_edit)
         self.group_combo = QComboBox()
         self._group_authorities = {}
         for group in groups:
@@ -3067,9 +3486,9 @@ class PasswordDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Change password — %s" % name)
         self.old_edit = QLineEdit()
-        self.old_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        configure_password_edit(self.old_edit)
         self.new_edit = QLineEdit()
-        self.new_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        configure_password_edit(self.new_edit)
         form = QGridLayout()
         form.addWidget(QLabel("Old password:"), 0, 0)
         form.addWidget(self.old_edit, 0, 1)
@@ -3110,6 +3529,7 @@ class EncodeTableDialog(QDialog):
         table.verticalHeader().setVisible(True)
         table.setSortingEnabled(False)
         self.table = table
+        install_copy_menu(table)
 
         channels = len(window._encode_configs)
         table.setRowCount(channels)
@@ -3210,17 +3630,22 @@ class EncodeTableDialog(QDialog):
                         if name not in names:
                             names.append(name)
                 editor.addItems(names or list(ENCODE_RESOLUTIONS))
+                if key == "s_res":
+                    if editor.findText("HD1") < 0:
+                        editor.addItem("HD1")
+                    editor.setCurrentText("HD1")
             elif key.endswith("_fps"):
                 editor = QSpinBox()
                 editor.setRange(1, 30)
-                editor.setValue(25)
+                editor.setValue(20 if key.startswith("m_") else 12)
             elif key.endswith("_rc"):
                 editor = QComboBox()
                 editor.addItems(ENCODE_RATE_CONTROL)
+                editor.setCurrentText("VBR")
             elif key.endswith("_quality"):
                 editor = QSpinBox()
                 editor.setRange(1, 6)
-                editor.setValue(3)
+                editor.setValue(4 if key.startswith("m_") else 3)
             elif key.endswith("_gop"):
                 editor = QSpinBox()
                 editor.setRange(1, 250)
@@ -3240,11 +3665,15 @@ class EncodeTableDialog(QDialog):
         header = table.horizontalHeader()
 
         def sync_footer(*_):
-            footer.verticalHeader().setFixedWidth(table.verticalHeader().width())
-            for column in range(len(self.KEYS)):
-                footer.setColumnWidth(column, header.sectionSize(column))
-            footer.setFixedHeight(footer.rowHeight(0) + footer.rowHeight(1)
-                                  + 2 * footer.frameWidth())
+            try:
+                footer.verticalHeader().setFixedWidth(
+                    table.verticalHeader().width())
+                for column in range(len(self.KEYS)):
+                    footer.setColumnWidth(column, header.sectionSize(column))
+                footer.setFixedHeight(footer.rowHeight(0) + footer.rowHeight(1)
+                                      + 2 * footer.frameWidth())
+            except RuntimeError:
+                return
 
         self._sync_footer = sync_footer
         header.sectionResized.connect(sync_footer)
@@ -3343,6 +3772,558 @@ class EncodeTableDialog(QDialog):
         self.accept()
 
 
+class SnapshotWindow(QDialog):
+    """Popup that shows a NETIP snapshot; right-click to save it."""
+
+    def __init__(self, image, data, default_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Snapshot")
+        self.setModal(False)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self._image = image
+        self._data = bytes(data)
+        self._default_name = default_name
+
+        shown = image
+        screen = parent.screen() if parent is not None else QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            max_width = max(160, int(area.width() * 0.9))
+            max_height = max(160, int(area.height() * 0.9))
+            if image.width() > max_width or image.height() > max_height:
+                shown = image.scaled(
+                    max_width, max_height,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
+
+        self.label = QLabel()
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("background-color: #101010;")
+        self.label.setPixmap(QPixmap.fromImage(shown))
+        self.label.setFixedSize(shown.size())
+        self.label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.label.customContextMenuRequested.connect(self._context_menu)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.label)
+        self.setFixedSize(shown.size())
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+
+    def _context_menu(self, point):
+        menu = QMenu(self)
+        save = menu.addAction("Save image...")
+        save.triggered.connect(self._save)
+        menu.exec(self.label.mapToGlobal(point))
+
+    def _save(self):
+        settings = QSettings("xmdm3", "xmdms")
+        start_dir = str(settings.value("snapshot_dir", "", type=str) or "")
+        if not start_dir:
+            start_dir = os.path.expanduser("~")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save snapshot", os.path.join(start_dir, self._default_name),
+            "JPEG image (*.jpg *.jpeg);;PNG image (*.png);;All files (*)")
+        if not path:
+            return
+        _root, ext = os.path.splitext(path)
+        if not ext:
+            path += ".jpg"
+            ext = ".jpg"
+        try:
+            if (ext.lower() in (".jpg", ".jpeg")
+                    and self._data[:2] == b"\xff\xd8"):
+                with open(path, "wb") as handle:
+                    handle.write(self._data)
+            elif not self._image.save(path):
+                raise OSError("unsupported image format")
+        except OSError as error:
+            QMessageBox.warning(
+                self, "Save snapshot", "Cannot save %s: %s" % (path, error))
+            return
+        settings.setValue("snapshot_dir", os.path.dirname(path))
+
+
+class RecoveryDialog(QDialog):
+    """Build an XM-DVR recovery image from a firmware zip."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Recovery image")
+        self.resize(560, 430)
+        self._zip_path = ""
+        self._entries = []
+
+        self.input_edit = QLineEdit()
+        self.input_edit.setReadOnly(True)
+        input_button = QPushButton("Browse...")
+        input_button.clicked.connect(self._pick_input)
+        input_row = QHBoxLayout()
+        input_row.addWidget(QLabel("Firmware file:"))
+        input_row.addWidget(self.input_edit, 1)
+        input_row.addWidget(input_button)
+
+        self.file_list = QListWidget()
+        self.file_list.itemChanged.connect(self._update_summary)
+
+        select_all = QPushButton("Select all")
+        select_all.clicked.connect(lambda: self._set_all(True))
+        select_none = QPushButton("Select none")
+        select_none.clicked.connect(lambda: self._set_all(False))
+        list_bar = QHBoxLayout()
+        list_bar.addWidget(QLabel("Files to include:"))
+        list_bar.addStretch(1)
+        list_bar.addWidget(select_all)
+        list_bar.addWidget(select_none)
+
+        self.output_edit = QLineEdit()
+        output_button = QPushButton("Save as...")
+        output_button.clicked.connect(self._pick_output)
+        output_row = QHBoxLayout()
+        output_row.addWidget(QLabel("Output file:"))
+        output_row.addWidget(self.output_edit, 1)
+        output_row.addWidget(output_button)
+
+        self.summary_label = QLabel("Pick a firmware zip to begin.")
+        self.build_button = QPushButton("Build")
+        self.build_button.clicked.connect(self._build)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.summary_label, 1)
+        buttons.addWidget(self.build_button)
+        buttons.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(input_row)
+        layout.addLayout(list_bar)
+        layout.addWidget(self.file_list, 1)
+        layout.addLayout(output_row)
+        layout.addLayout(buttons)
+
+
+    def _notify(self, text):
+        self.summary_label.setText(text)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_message"):
+            parent._message(text)
+
+    @staticmethod
+    def _size(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        for unit in ("B", "KiB", "MiB", "GiB"):
+            if number < 1024 or unit == "GiB":
+                if unit == "B":
+                    return "%d %s" % (number, unit)
+                return "%.1f %s" % (number, unit)
+            number /= 1024.0
+        return str(value)
+
+    def _pick_input(self):
+        settings = QSettings("xmdm3", "xmdms")
+        start_dir = os.path.dirname(self._zip_path) or str(
+            settings.value("firmware_dir", "", type=str) or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select firmware file", start_dir,
+            "Firmware files (*.bin);;All files (*)")
+        if not path:
+            return
+        self._zip_path = path
+        self.input_edit.setText(path)
+        settings.setValue("firmware_dir", os.path.dirname(path))
+        self.output_edit.setText(os.path.splitext(path)[0] + ".img")
+        self._load_entries()
+
+    def _load_entries(self):
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        self._entries = []
+        error = None
+        try:
+            with zipfile.ZipFile(self._zip_path) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    if not info.filename.lower().endswith(".img"):
+                        continue
+                    self._entries.append(info.filename)
+                    item = QListWidgetItem("%s  (%s)" % (
+                        info.filename, self._size(info.file_size)))
+                    item.setFlags(
+                        item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Checked)
+                    item.setData(Qt.ItemDataRole.UserRole, info.filename)
+                    self.file_list.addItem(item)
+        except (OSError, zipfile.BadZipFile) as exc:
+            error = exc
+        self.file_list.blockSignals(False)
+        self._update_summary()
+        if error is not None:
+            self._notify("Cannot read the firmware file")
+
+    def _set_all(self, checked):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self.file_list.blockSignals(True)
+        for index in range(self.file_list.count()):
+            self.file_list.item(index).setCheckState(state)
+        self.file_list.blockSignals(False)
+        self._update_summary()
+
+    def _selected(self):
+        names = []
+        for index in range(self.file_list.count()):
+            item = self.file_list.item(index)
+            if item.checkState() == Qt.CheckState.Checked:
+                names.append(item.data(Qt.ItemDataRole.UserRole))
+        return names
+
+    def _update_summary(self, *_):
+        total = self.file_list.count()
+        if not total:
+            self.summary_label.setText("No .img files found.")
+            return
+        self.summary_label.setText(
+            "%d of %d file(s) selected" % (len(self._selected()), total))
+
+    def _pick_output(self):
+        start = self.output_edit.text().strip()
+        if not start:
+            base = os.path.splitext(os.path.basename(self._zip_path))[0] or "recovery"
+            start = os.path.join(os.path.dirname(self._zip_path), base + ".img")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save recovery image", start,
+            "Recovery image (*.img);;All files (*)")
+        if path:
+            self.output_edit.setText(path)
+
+    def _build(self):
+        output = self.output_edit.text().strip()
+        if not self._zip_path or not os.path.isfile(self._zip_path):
+            self._notify("Pick a firmware file first.")
+            return
+        if not output:
+            self._notify("Choose an output file.")
+            return
+        names = self._selected()
+        if not names:
+            self._notify("Select at least one file to include.")
+            return
+        size = 0
+        try:
+            with zipfile.ZipFile(self._zip_path) as archive:
+                with open(output, "wb+") as handle:
+                    handle.write(b"\x00" * 64)
+                    handle.seek(0)
+                    handle.write(b"XM-DVR")
+                    handle.seek(20)
+                    handle.write(b"\x40")
+                    handle.seek(64)
+                    for name in names:
+                        handle.write(archive.read(name))
+                    size = handle.tell()
+                    handle.seek(24)
+                    handle.write(size.to_bytes(4, "little"))
+        except (OSError, zipfile.BadZipFile, KeyError):
+            self._notify("Recovery image failed")
+            return
+        self._notify("Recovery image written successfully")
+
+
+class DumpDialog(QDialog):
+    """Build a flat flash dump from the uImage files inside a firmware zip."""
+
+    COLUMNS = ("", "#", "Name", "Load", "Entry", "Size")
+    COL_CHECK = 0
+    COL_NAME = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Firmware dump")
+        self.resize(700, 470)
+        self._zip_path = ""
+        self._entries = {}
+
+        self.input_edit = QLineEdit()
+        self.input_edit.setReadOnly(True)
+        input_button = QPushButton("Browse...")
+        input_button.clicked.connect(self._pick_input)
+        input_row = QHBoxLayout()
+        input_row.addWidget(QLabel("Firmware file:"))
+        input_row.addWidget(self.input_edit, 1)
+        input_row.addWidget(input_button)
+
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(8, 4096)
+        self.size_spin.setValue(8)
+        self.size_spin.setSuffix(" MB")
+        self.size_spin.setMaximumWidth(100)
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Dump size:"))
+        size_row.addWidget(self.size_spin)
+        size_row.addStretch(1)
+
+        self.file_table = QTableWidget(0, len(self.COLUMNS))
+        self.file_table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.file_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        self.file_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self.file_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self.file_table.setAlternatingRowColors(True)
+        self.file_table.verticalHeader().setVisible(False)
+        header = self.file_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        metrics = self.file_table.fontMetrics()
+        indicator = self.style().pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorWidth)
+        fixed_widths = (
+            (self.COL_CHECK, indicator + 10),
+            (1, metrics.horizontalAdvance("99") + 12),
+            (3, metrics.horizontalAdvance("0x00000000") + 12),
+            (4, metrics.horizontalAdvance("0x00000000") + 12),
+            (5, metrics.horizontalAdvance("8888.8 MiB") + 12),
+        )
+        for column, width in fixed_widths:
+            header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.Fixed)
+            self.file_table.setColumnWidth(column, width)
+        header.setSectionResizeMode(
+            self.COL_NAME, QHeaderView.ResizeMode.Stretch)
+        self.file_table.itemChanged.connect(self._update_summary)
+
+        select_all = QPushButton("Select all")
+        select_all.clicked.connect(lambda: self._set_all(True))
+        select_none = QPushButton("Select none")
+        select_none.clicked.connect(lambda: self._set_all(False))
+        list_bar = QHBoxLayout()
+        list_bar.addWidget(QLabel("Files to include:"))
+        list_bar.addStretch(1)
+        list_bar.addWidget(select_all)
+        list_bar.addWidget(select_none)
+
+        self.output_edit = QLineEdit()
+        output_button = QPushButton("Save as...")
+        output_button.clicked.connect(self._pick_output)
+        output_row = QHBoxLayout()
+        output_row.addWidget(QLabel("Output file:"))
+        output_row.addWidget(self.output_edit, 1)
+        output_row.addWidget(output_button)
+
+        self.summary_label = QLabel("Pick a firmware file to begin.")
+        self.build_button = QPushButton("Build")
+        self.build_button.clicked.connect(self._build)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.summary_label, 1)
+        buttons.addWidget(self.build_button)
+        buttons.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(input_row)
+        layout.addLayout(size_row)
+        layout.addLayout(list_bar)
+        layout.addWidget(self.file_table, 1)
+        layout.addLayout(output_row)
+        layout.addLayout(buttons)
+
+    def _notify(self, text):
+        self.summary_label.setText(text)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_message"):
+            parent._message(text)
+
+    @staticmethod
+    def _size(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        for unit in ("B", "KiB", "MiB"):
+            if number < 1024 or unit == "MiB":
+                if unit == "B":
+                    return "%d %s" % (number, unit)
+                return "%.1f %s" % (number, unit)
+            number /= 1024.0
+        return str(value)
+
+    def _pick_input(self):
+        settings = QSettings("xmdm3", "xmdms")
+        start_dir = os.path.dirname(self._zip_path) or str(
+            settings.value("firmware_dir", "", type=str) or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select firmware file", start_dir,
+            "Firmware files (*.bin);;All files (*)")
+        if not path:
+            return
+        self._zip_path = path
+        self.input_edit.setText(path)
+        settings.setValue("firmware_dir", os.path.dirname(path))
+        self.output_edit.setText(os.path.splitext(path)[0] + ".dump")
+        self._load_entries()
+
+    def _load_entries(self):
+        table = self.file_table
+        table.blockSignals(True)
+        table.setRowCount(0)
+        self._entries = {}
+        error = None
+        try:
+            with zipfile.ZipFile(self._zip_path) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    try:
+                        data = archive.read(info.filename)
+                    except (OSError, zipfile.BadZipFile):
+                        continue
+                    header = parse_uimage_header(data)
+                    if header is None:
+                        continue
+                    self._entries[info.filename] = header
+                    row = table.rowCount()
+                    table.insertRow(row)
+                    check = QTableWidgetItem()
+                    check.setFlags(
+                        Qt.ItemFlag.ItemIsUserCheckable
+                        | Qt.ItemFlag.ItemIsEnabled
+                        | Qt.ItemFlag.ItemIsSelectable)
+                    check.setCheckState(Qt.CheckState.Checked)
+                    check.setData(Qt.ItemDataRole.UserRole, info.filename)
+                    table.setItem(row, self.COL_CHECK, check)
+                    table.setItem(row, 1, QTableWidgetItem(str(row + 1)))
+                    table.setItem(row, self.COL_NAME, QTableWidgetItem(info.filename))
+                    table.setItem(row, 3, QTableWidgetItem(
+                        "0x%08X" % header["load"]))
+                    table.setItem(row, 4, QTableWidgetItem(
+                        "0x%08X" % header["entry"]))
+                    table.setItem(row, 5, QTableWidgetItem(
+                        self._size(header["size"])))
+        except (OSError, zipfile.BadZipFile) as exc:
+            error = exc
+        table.blockSignals(False)
+        self._update_summary()
+        if error is not None:
+            self._notify("Cannot read the firmware file: %s" % error)
+
+    def _set_all(self, checked):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        table = self.file_table
+        table.blockSignals(True)
+        for row in range(table.rowCount()):
+            item = table.item(row, self.COL_CHECK)
+            if item is not None:
+                item.setCheckState(state)
+        table.blockSignals(False)
+        self._update_summary()
+
+    def _selected(self):
+        table = self.file_table
+        names = []
+        for row in range(table.rowCount()):
+            item = table.item(row, self.COL_CHECK)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                names.append(item.data(Qt.ItemDataRole.UserRole))
+        return names
+
+    def _required_mb(self):
+        required = 0
+        for name in self._selected():
+            header = self._entries.get(name)
+            if not header:
+                continue
+            required = max(required, header["load"] + header["size"])
+        if not required:
+            return 0
+        return max(8, (required + (1 << 20) - 1) >> 20)
+
+    def _bump_size(self, required_mb):
+        if required_mb <= self.size_spin.value():
+            return
+        target = None
+        for step in DUMP_SIZE_STEPS:
+            if step >= required_mb:
+                target = step
+                break
+        if target is None:
+            target = min(4096, ((required_mb + 1023) // 1024) * 1024)
+        self.size_spin.setValue(target)
+
+    def _update_summary(self, *_):
+        total = self.file_table.rowCount()
+        if not total:
+            self.summary_label.setText("No uImage files found.")
+            return
+        required = self._required_mb()
+        self._bump_size(required)
+        self.summary_label.setText(
+            "%d of %d file(s) selected (need %d MB)" % (
+                len(self._selected()), total, required))
+
+    def _pick_output(self):
+        start = self.output_edit.text().strip()
+        if not start:
+            base = os.path.splitext(os.path.basename(self._zip_path))[0] or "dump"
+            start = os.path.join(os.path.dirname(self._zip_path), base + ".dump")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save dump", start, "Dump image (*.dump);;All files (*)")
+        if path:
+            self.output_edit.setText(path)
+
+    def _build(self):
+        output = self.output_edit.text().strip()
+        if not self._zip_path or not os.path.isfile(self._zip_path):
+            self._notify("Pick a firmware file first.")
+            return
+        if not output:
+            self._notify("Choose an output file.")
+            return
+        names = self._selected()
+        if not names:
+            self._notify("Select at least one file to include.")
+            return
+        self._bump_size(self._required_mb())
+        size_mb = self.size_spin.value()
+        dump = bytearray(size_mb * 1024 * 1024)
+        written = 0
+        skipped = []
+        try:
+            with zipfile.ZipFile(self._zip_path) as archive:
+                for name in names:
+                    data = archive.read(name)
+                    header = parse_uimage_header(data)
+                    if header is None:
+                        skipped.append(name)
+                        continue
+                    payload = bytes(data[UIMAGE_HEADER_SIZE:
+                                         UIMAGE_HEADER_SIZE + header["size"]])
+                    offset = header["load"]
+                    if offset + len(payload) > len(dump):
+                        skipped.append(name)
+                        continue
+                    dump[offset:offset + len(payload)] = payload
+                    written += 1
+        except (OSError, zipfile.BadZipFile):
+            self._notify("Dump failed: cannot read the firmware file")
+            return
+        if not written:
+            self._notify("Dump failed: nothing to write")
+            return
+        try:
+            with open(output, "wb") as handle:
+                handle.write(dump)
+        except OSError:
+            self._notify("Dump failed: cannot write the output file")
+            return
+        if skipped:
+            self._notify("Dump written successfully (%d skipped)" % len(skipped))
+        else:
+            self._notify("Dump written successfully")
+
+
 class ResetConfigDialog(QDialog):
     FIELDS = (
         ("General", "General"),
@@ -3419,12 +4400,75 @@ class ResetConfigDialog(QDialog):
         return config
 
 
+class DigNetworkDialog(QDialog):
+    """Edit the network settings of an IPC found through the NVR search."""
+
+    def __init__(self, device, username="admin", password="", parent=None):
+        super().__init__(parent)
+        address = format_ipv4(device.get("HostIP"))
+        self.setWindowTitle("Network settings — %s" % (address or "device"))
+        self.address_edit = IpAddressEdit()
+        self.address_edit.setValue(address)
+        self.submask_edit = IpAddressEdit()
+        self.submask_edit.setValue(
+            format_ipv4(device.get("Submask")) or "255.255.255.0")
+        gateway = format_ipv4(device.get("GateWay"))
+        if not gateway and address:
+            gateway = address.rsplit(".", 1)[0] + ".1"
+        self.gateway_edit = IpAddressEdit()
+        self.gateway_edit.setValue(gateway)
+        self.user_edit = QLineEdit(username or "admin")
+        self.password_edit = QLineEdit(password or "")
+        configure_password_edit(self.password_edit)
+
+        form = QGridLayout()
+        rows = (
+            ("IP address:", self.address_edit),
+            ("Subnet mask:", self.submask_edit),
+            ("Gateway:", self.gateway_edit),
+            ("Login:", self.user_edit),
+            ("Password:", self.password_edit),
+        )
+        for row, (label, widget) in enumerate(rows):
+            form.addWidget(QLabel(label), row, 0)
+            form.addWidget(widget, row, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        if not (self.address_edit.value() and self.submask_edit.value()
+                and self.gateway_edit.value()):
+            QMessageBox.warning(
+                self, "Network settings",
+                "Enter a valid IP address, subnet mask and gateway.")
+            return
+        super().accept()
+
+    def values(self):
+        return {
+            "address": self.address_edit.value(),
+            "submask": self.submask_edit.value(),
+            "gateway": self.gateway_edit.value(),
+            "username": self.user_edit.text().strip() or "admin",
+            "password": self.password_edit.text(),
+        }
+
+
 class DigitalChannelsDialog(QDialog):
-    SEARCH_COLUMNS = ("Set", "IP", "Port", "MAC", "SN", "Host Name", "Channels", "Type")
+    SEARCH_COLUMNS = ("Set", "IP", "Mask", "Gateway", "Port", "MAC", "SN",
+                      "Host Name", "Channels", "Type")
     CHANNEL_COLUMNS = ("On", "Name", "IP", "Port", "SyncRes", "SyncTime",
-                       "Decode Prio", "Channel", "Protocol", "User", "Password",
+                       "Prio", "Ch", "Protocol", "User", "Password",
                        "CfgName")
-    CHANNEL_WIDTHS = (40, 130, 110, 60, 60, 80, 90, 60, 80, 80, 100, 130)
+    CHANNEL_WIDTHS = (40, 130, 110, 60, 60, 80, 55, 40, 80, 80, 100, 130)
     DEVICE_TYPES = {305201157: "NVR", 305201156: "DVR", 7: "IPC WiFi", 4: "NVR", 0: "IPC"}
     SYNC_TIME_OPTIONS = ("OFF", "T&Z", "Local", "UTC")
     DELAY_OPTIONS = (150, 250, 333, 667, 1000, 2000, 3000)
@@ -3449,6 +4493,7 @@ class DigitalChannelsDialog(QDialog):
         self._address = device.get("ip") or ""
         self._cloud_id = device.get("cloud_id") or ""
         self._rps = bool(device.get("rps", True))
+        self._no_md5 = bool(device.get("no_md5"))
         self._port = int(device.get("tcp_port") or 34567)
         self._username = username
         self._password = password
@@ -3497,6 +4542,10 @@ class DigitalChannelsDialog(QDialog):
 
         self.search_table = self._make_table(self.SEARCH_COLUMNS)
         self.search_table.verticalHeader().setVisible(True)
+        self.search_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.search_table.customContextMenuRequested.connect(
+            self._search_context_menu)
         self.search_table.itemChanged.connect(self._on_search_item_changed)
         self.search_table.itemSelectionChanged.connect(self._on_search_selection)
 
@@ -3507,6 +4556,7 @@ class DigitalChannelsDialog(QDialog):
 
         self.channel_table = QTableWidget(0, len(self.CHANNEL_COLUMNS))
         self.channel_table.setHorizontalHeaderLabels(self.CHANNEL_COLUMNS)
+        install_copy_menu(self.channel_table)
         self.channel_table.setEditTriggers(
             QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.EditKeyPressed)
         self.channel_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -3555,15 +4605,24 @@ class DigitalChannelsDialog(QDialog):
     def _build_apply_panel(self):
         self.username_input = QLineEdit("admin")
         self.password_input = QLineEdit()
+        configure_password_edit(self.password_input)
         self.name_input = QLineEdit("CAM")
         self.protocol_input = QComboBox()
         self.protocol_input.addItems(self.PROTOCOL_OPTIONS)
-        self.syncres_input = QCheckBox()
+        self.syncres_input = QComboBox()
+        self.syncres_input.addItems(("Disabled", "Enabled"))
+        self.syncres_input.setCurrentText("Disabled")
         self.synctime_input = QComboBox()
         self.synctime_input.addItems(self.SYNC_TIME_OPTIONS)
         self.synctime_input.setCurrentText("Local")
         self.delay_input = QComboBox()
         self.delay_input.addItems([str(value) for value in self.DELAY_OPTIONS])
+        self.delay_input.setCurrentText(str(self.DELAY_DEFAULT))
+        self.subnet_input = QLineEdit()
+        self.subnet_input.setPlaceholderText("192.168.1")
+        self.subnet_input.setToolTip(
+            "To All replaces the first three octets of each channel IP, "
+            "keeping that channel's last octet (e.g. 192.168.1).")
 
         fields = (
             ("User:", self.username_input,
@@ -3575,16 +4634,20 @@ class DigitalChannelsDialog(QDialog):
             ("Protocol:", self.protocol_input,
              lambda: self._apply_combo(self.COL_PROTOCOL, self.protocol_input.currentText())),
             ("Sync res:", self.syncres_input,
-             lambda: self._apply_check(self.COL_SYNC_RES, self.syncres_input.isChecked())),
+             lambda: self._apply_check(
+                 self.COL_SYNC_RES,
+                 self.syncres_input.currentText() == "Enabled")),
             ("Sync time:", self.synctime_input,
              lambda: self._apply_combo(self.COL_SYNC_TIME, self.synctime_input.currentText())),
             ("Delay decode:", self.delay_input,
              lambda: self._apply_combo(self.COL_DELAY, self.delay_input.currentText())),
+            ("Subnet:", self.subnet_input,
+             lambda: self._apply_subnet()),
         )
         width = self.fontMetrics().averageCharWidth() * 10 + 20
         for widget in (self.username_input, self.password_input, self.name_input,
                        self.protocol_input, self.syncres_input,
-                       self.synctime_input, self.delay_input):
+                       self.synctime_input, self.delay_input, self.subnet_input):
             widget.setFixedWidth(width)
         grid = QGridLayout()
         for column, (label, widget, handler) in enumerate(fields):
@@ -3625,25 +4688,48 @@ class DigitalChannelsDialog(QDialog):
             return decoder[0]
         return None
 
-    def _start(self, action, handler, changes=None):
+    def _start(self, action, handler, changes=None, on_failed=None):
         if self._thread is not None:
             return
         thread = NetipThread(
             action, self._address, self._username, self._password,
             cloud_id=self._cloud_id, rps=self._rps, changes=changes,
-            port=self._port, parent=self)
+            port=self._port, parent=self, no_md5=self._no_md5)
         thread.fetched.connect(handler)
         thread.applied.connect(handler)
-        thread.failed.connect(self._on_failed)
+        thread.failed.connect(on_failed or self._on_failed)
         thread.finished.connect(self._on_finished)
         self._thread = thread
         self.search_button.setEnabled(False)
         self.apply_button.setEnabled(False)
         thread.start()
 
+    @staticmethod
+    def _error_text(ret):
+        if ret is None:
+            return "no reply code"
+        return "%s (Ret=%s)" % (RESULT_CODES.get(ret, "error"), ret)
+
+    @staticmethod
+    def _is_auth_failure(text):
+        lowered = str(text or "").lower()
+        if any("ret=%d" % code in lowered for code in AUTH_ERROR_CODES):
+            return True
+        return any(hint in lowered for hint in AUTH_ERROR_HINTS)
+
+    @staticmethod
+    def _is_timeout_failure(text):
+        lowered = str(text or "").lower()
+        if any("ret=%d" % code in lowered for code in TIMEOUT_ERROR_CODES):
+            return True
+        return any(hint in lowered for hint in TIMEOUT_ERROR_HINTS)
+
     def _on_failed(self, text):
         if self._prov_active and self._prov_current is not None:
-            self._provision_retry(self._prov_current, text)
+            if self._is_auth_failure(text):
+                self._provision_failed(self._prov_current, text)
+            else:
+                self._provision_retry(self._prov_current, text)
             return
         QMessageBox.warning(self, "Digital channels", text)
 
@@ -3692,6 +4778,14 @@ class DigitalChannelsDialog(QDialog):
             self._fill_channel_row(row, entry, decoder, title, time_syn_value, delay_value)
         table.setUpdatesEnabled(True)
         self._renumber_channels()
+        if not self.subnet_input.text().strip():
+            for row in range(table.rowCount()):
+                address = self._cell_text(row, self.COL_IP)
+                octets = address.split(".")
+                if len(octets) == 4:
+                    self.subnet_input.setText(".".join(octets[:3]))
+                    break
+        self._refresh_local_table()
 
     @staticmethod
     def _entry_value(entries, row, key):
@@ -3711,13 +4805,22 @@ class DigitalChannelsDialog(QDialog):
         self._set_combo_item(
             row, self.COL_DELAY, [str(value) for value in self.DELAY_OPTIONS],
             self._text(delay if delay is not None else self.DELAY_DEFAULT))
-        self._set_text_item(row, self.COL_CHANNEL, decoder.get("Channel"))
+        self._set_text_item(
+            row, self.COL_CHANNEL, self._channel_label(decoder.get("Channel")))
         self._set_combo_item(
             row, self.COL_PROTOCOL, self.PROTOCOL_OPTIONS,
             self._text(decoder.get("Protocol") or "NETIP"))
         self._set_text_item(row, self.COL_USER, decoder.get("UserName") or "admin")
         self._set_text_item(row, self.COL_PASSWORD, decoder.get("PassWord") or "")
         self._set_text_item(row, self.COL_CONFNAME, decoder.get("ConfName"))
+
+    @staticmethod
+    def _channel_label(value):
+        """Show the zero-based channel as a human 1-based number."""
+        try:
+            return str(int(value) + 1)
+        except (TypeError, ValueError):
+            return "" if value is None else str(value)
 
     def _set_text_item(self, row, column, value):
         item = QTableWidgetItem(self._text(value))
@@ -3726,6 +4829,17 @@ class DigitalChannelsDialog(QDialog):
         self.channel_table.setItem(row, column, item)
 
     def _set_check_item(self, row, column, checked):
+        if column in (self.COL_ON, self.COL_SYNC_RES):
+            container = QWidget()
+            layout = QHBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addStretch(1)
+            box = QCheckBox()
+            box.setChecked(bool(checked))
+            layout.addWidget(box)
+            layout.addStretch(1)
+            self.channel_table.setCellWidget(row, column, container)
+            return
         item = QTableWidgetItem()
         item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
         item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
@@ -3770,7 +4884,34 @@ class DigitalChannelsDialog(QDialog):
     def _apply_check(self, column, checked):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for row in range(self.channel_table.rowCount()):
-            self._item(row, column).setCheckState(state)
+            widget = self.channel_table.cellWidget(row, column)
+            box = widget.findChild(QCheckBox) if widget is not None else None
+            if box is not None:
+                box.setChecked(bool(checked))
+            else:
+                self._item(row, column).setCheckState(state)
+
+    def _apply_subnet(self):
+        text = self.subnet_input.text().strip().rstrip(".")
+        octets = text.split(".")
+        if (len(octets) != 3
+                or not all(part.isdigit() and 0 <= int(part) <= 255
+                           for part in octets)):
+            self.provision_status.setText(
+                "Subnet must be three octets, e.g. 192.168.1")
+            return
+        prefix = ".".join(str(int(part)) for part in octets)
+        changed = 0
+        for row in range(self.channel_table.rowCount()):
+            address = self._cell_text(row, self.COL_IP)
+            parts = address.split(".")
+            if len(parts) != 4 or not parts[3].isdigit():
+                continue
+            self._item(row, self.COL_IP).setText(
+                "%s.%s" % (prefix, parts[3]))
+            changed += 1
+        self.provision_status.setText(
+            "Subnet changed for %d channel(s)." % changed)
 
     def _apply_combo(self, column, text):
         for row in range(self.channel_table.rowCount()):
@@ -3807,8 +4948,24 @@ class DigitalChannelsDialog(QDialog):
             return address
         return str(device.get("SN") or "").strip()
 
+    def _channel_device_keys(self):
+        """MACs and IPs already present in the channel list."""
+        macs = set()
+        addresses = set()
+        for row in range(self.channel_table.rowCount()):
+            entry = self._remote_entries[row] if row < len(self._remote_entries) else {}
+            decoder = self._decoder(entry) or {}
+            mac = str(decoder.get("MacAddr") or "").strip().lower()
+            if mac:
+                macs.add(mac)
+            address = self._cell_text(row, self.COL_IP).strip()
+            if address:
+                addresses.add(address)
+        return macs, addresses
+
     def _refresh_local_table(self, *_):
         devices = self._filtered_local_devices()
+        added_macs, added_addresses = self._channel_device_keys()
         self.search_table.setSortingEnabled(False)
         self.search_table.setRowCount(len(devices))
         for row, device in enumerate(devices):
@@ -3824,6 +4981,8 @@ class DigitalChannelsDialog(QDialog):
             self.search_table.setItem(row, 0, check)
             values = (
                 format_ipv4(device.get("HostIP")),
+                format_ipv4(device.get("Submask")),
+                format_ipv4(device.get("GateWay")),
                 self._text(device.get("TCPPort")),
                 self._text(device.get("MAC")),
                 self._text(device.get("SN")),
@@ -3831,9 +4990,25 @@ class DigitalChannelsDialog(QDialog):
                 self._text(device.get("ChannelNum")),
                 self.DEVICE_TYPES.get(device.get("DeviceType"), self._text(device.get("DeviceType"))),
             )
+            mac = str(device.get("MAC") or "").strip().lower()
+            address = format_ipv4(device.get("HostIP"))
+            already_added = bool((mac and mac in added_macs)
+                                 or (address and address in added_addresses))
             for column, value in enumerate(values, start=1):
-                self.search_table.setItem(row, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if already_added:
+                    item.setForeground(QBrush(QColor("#9E9E9E")))
+                    item.setToolTip("Already in the channels list")
+                self.search_table.setItem(row, column, item)
+            if already_added:
+                check.setToolTip("Already in the channels list")
         self.search_table.resizeColumnsToContents()
+        address_width = (
+            self.search_table.fontMetrics().horizontalAdvance("255.255.255.255") + 24)
+        header = self.search_table.horizontalHeader()
+        for column in (1, 2, 3):
+            header.resizeSection(
+                column, max(header.sectionSize(column), address_width))
         self.search_table.setSortingEnabled(True)
 
     def _on_search_item_changed(self, item):
@@ -3891,13 +5066,140 @@ class DigitalChannelsDialog(QDialog):
         return None
 
     def _add_all_ipc(self):
+        added_macs, added_addresses = self._channel_device_keys()
         for device in self._filtered_local_devices():
             if device.get("DeviceType") not in (0, 7):
                 continue
-            if not format_ipv4(device.get("HostIP")):
+            address = format_ipv4(device.get("HostIP"))
+            if not address:
+                continue
+            mac = str(device.get("MAC") or "").strip().lower()
+            if (mac and mac in added_macs) or address in added_addresses:
                 continue
             if not self._append_ipc_channel(device):
                 break
+            if mac:
+                added_macs.add(mac)
+            added_addresses.add(address)
+        self._refresh_local_table()
+
+    def _device_by_search_key(self, key):
+        for device in self._local_devices:
+            if self._search_key(device) == key:
+                return device
+        return None
+
+    def _search_context_menu(self, point):
+        index = self.search_table.indexAt(point)
+        if not index.isValid():
+            return
+        item = self.search_table.item(index.row(), 0)
+        key = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        device = self._device_by_search_key(key)
+        value = table_cell_text(self.search_table, index)
+        menu = QMenu(self.search_table)
+        copy_action = menu.addAction("Copy")
+        copy_action.setEnabled(bool(value))
+        copy_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(value))
+        menu.addSeparator()
+        add_action = menu.addAction("Add to channels")
+        add_action.setEnabled(device is not None)
+        add_action.triggered.connect(
+            lambda: self._add_search_device(device))
+        network_action = menu.addAction("Change network settings...")
+        network_action.setEnabled(device is not None)
+        network_action.triggered.connect(
+            lambda: self._edit_search_device_network(device))
+        menu.exec(self.search_table.viewport().mapToGlobal(point))
+
+    def _add_search_device(self, device):
+        if not isinstance(device, dict):
+            return
+        if not self._append_ipc_channel(device):
+            self.provision_status.setText(
+                "No empty channel slot available.")
+            return
+        self._refresh_local_table()
+        self.provision_status.setText(
+            "Added %s to channels" % (format_ipv4(device.get("HostIP"))))
+
+    def _edit_search_device_network(self, device):
+        if not isinstance(device, dict):
+            return
+        dialog = DigNetworkDialog(
+            device, self.username_input.text().strip() or "admin",
+            self.password_input.text(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._send_search_device_network(device, dialog.values())
+
+    def _send_search_device_network(self, device, values):
+        row = self._channel_row_for_device(device)
+        entry = (self._remote_entries[row]
+                 if row is not None and row < len(self._remote_entries) else {})
+        decoder = self._decoder(entry) or {}
+        mac = (str(device.get("MAC") or "").strip()
+               or str(decoder.get("MacAddr") or "").strip())
+        hostname = str(device.get("HostName") or "").strip()
+        netcfg = {
+            "GateWay": format_ip_set(values["gateway"]),
+            "HostIP": format_ip_set(values["address"]),
+            "Submask": format_ip_set(values["submask"]),
+            "MAC": mac,
+            "TCPPort": self._to_int(device.get("TCPPort"), 34567),
+            "HttpPort": self._to_int(device.get("HttpPort"), 80),
+        }
+        if hostname:
+            netcfg["HostName"] = hostname
+        channel = (self.channel_table.verticalHeader().visualIndex(row) + 1
+                   if row is not None else 0)
+        payload = {
+            "Name": "OPDIGSetIP",
+            "OPDIGSetIP": {
+                "Channel": channel,
+                "devtype": "IPC",
+                "LoginCfg": {
+                    "UserName": values["username"],
+                    "EncryptType": 1,
+                    "Password": sofia_hash(values["password"]),
+                },
+                "Netcfg": netcfg,
+            },
+        }
+        self._start(
+            "dig_set_ip",
+            lambda result, dev=device, vals=values:
+            self._on_search_network_result(dev, vals, result),
+            changes={"payload": payload},
+            on_failed=lambda text, dev=device:
+            self._on_search_network_failed(dev, text))
+
+    def _on_search_network_failed(self, device, text):
+        brush = (PROVISION_ACTIVE_BRUSH if self._is_timeout_failure(text)
+                 else PROVISION_FAILED_BRUSH)
+        self._set_search_row_brush(self._search_key(device), brush)
+        self.provision_status.setText("Network change failed: %s" % text)
+
+    def _on_search_network_result(self, device, values, payload):
+        reply = payload.get("OPDIGSetIP") if isinstance(payload, dict) else None
+        ret = reply.get("Ret") if isinstance(reply, dict) else None
+        if ret != 100:
+            reason = self._error_text(ret)
+            brush = (PROVISION_ACTIVE_BRUSH if self._is_timeout_failure(reason)
+                     else PROVISION_FAILED_BRUSH)
+            self._set_search_row_brush(self._search_key(device), brush)
+            self.provision_status.setText(
+                "Network change failed: %s" % reason)
+            return
+        device["HostIP"] = values["address"]
+        device["Submask"] = values["submask"]
+        device["GateWay"] = values["gateway"]
+        self._refresh_local_table()
+        self._set_search_row_brush(
+            self._search_key(device), PROVISION_OK_BRUSH)
+        self.provision_status.setText(
+            "Network settings applied: %s" % values["address"])
 
     def _append_ipc_channel(self, device):
         table = self.channel_table
@@ -3927,7 +5229,7 @@ class DigitalChannelsDialog(QDialog):
         self._set_combo_item(
             row, self.COL_DELAY, [str(value) for value in self.DELAY_OPTIONS],
             str(self.DELAY_DEFAULT))
-        self._set_text_item(row, self.COL_CHANNEL, "0")
+        self._set_text_item(row, self.COL_CHANNEL, "1")
         self._set_combo_item(row, self.COL_PROTOCOL, self.PROTOCOL_OPTIONS, protocol)
         self._set_text_item(row, self.COL_USER, "admin")
         self._set_text_item(row, self.COL_PASSWORD, "")
@@ -3943,6 +5245,10 @@ class DigitalChannelsDialog(QDialog):
         return item.text().strip() if item is not None else ""
 
     def _cell_checked(self, row, column):
+        widget = self.channel_table.cellWidget(row, column)
+        box = widget.findChild(QCheckBox) if widget is not None else None
+        if box is not None:
+            return box.isChecked()
         item = self.channel_table.item(row, column)
         return item is not None and item.checkState() == Qt.CheckState.Checked
 
@@ -3958,13 +5264,14 @@ class DigitalChannelsDialog(QDialog):
             return default
 
     @staticmethod
-    def _merge_entries(base, values, key):
+    def _merge_row_entries(base, values_by_row, key, rows):
+        """Merge fetched per-row values into base entries, following row moves."""
         merged = []
-        for index, value in enumerate(values):
-            entry = dict(base[index]) if index < len(base) and isinstance(base[index], dict) else {}
-            entry[key] = value
+        for row in rows:
+            entry = dict(base[row]) if row < len(base) and isinstance(base[row], dict) else {}
+            entry[key] = values_by_row.get(row)
             merged.append(entry)
-        for entry in base[len(values):]:
+        for entry in base[len(rows):]:
             merged.append(entry)
         return merged
 
@@ -3973,10 +5280,12 @@ class DigitalChannelsDialog(QDialog):
         header = table.verticalHeader()
         config = []
         titles = []
-        time_syn = []
-        decode_param = []
+        time_syn_by_row = {}
+        decode_param_by_row = {}
+        rows = []
         for visual in range(table.rowCount()):
             row = header.logicalIndex(visual)
+            rows.append(row)
             base = self._remote_entries[row] if row < len(self._remote_entries) else {}
             entry = dict(base) if isinstance(base, dict) else {}
             on = self._cell_checked(row, self.COL_ON)
@@ -3985,12 +5294,12 @@ class DigitalChannelsDialog(QDialog):
             entry.pop("TimeSyn", None)
             entry.pop("deleyTimeMs", None)
             titles.append(self._cell_text(row, self.COL_NAME))
-            time_syn.append(self._combo_text(row, self.COL_SYNC_TIME))
-            decode_param.append(self._to_int(
-                self._combo_text(row, self.COL_DELAY), self.DELAY_DEFAULT))
+            time_syn_by_row[row] = self._combo_text(row, self.COL_SYNC_TIME)
+            decode_param_by_row[row] = self._to_int(
+                self._combo_text(row, self.COL_DELAY), self.DELAY_DEFAULT)
             entry.setdefault("ConnType", "SINGLE")
             entry.setdefault("EnCheckTime", True)
-            entry.setdefault("SingleConnId", "0x00000000")
+            entry.setdefault("SingleConnId", "0x00000001")
             entry.setdefault("TourIntv", 10)
             ip = self._cell_text(row, self.COL_IP)
             decoder = dict(self._decoder(base) or {})
@@ -4002,8 +5311,11 @@ class DigitalChannelsDialog(QDialog):
                 decoder["IPAddress"] = ip
                 decoder["Port"] = self._to_int(
                     self._cell_text(row, self.COL_PORT), 34567)
-                decoder["Channel"] = self._to_int(
-                    self._cell_text(row, self.COL_CHANNEL), 0)
+                channel_text = self._cell_text(row, self.COL_CHANNEL).strip()
+                try:
+                    decoder["Channel"] = max(0, int(channel_text) - 1)
+                except (TypeError, ValueError):
+                    decoder["Channel"] = 0
                 decoder["UserName"] = self._cell_text(row, self.COL_USER) or "admin"
                 decoder["PassWord"] = self._cell_text(row, self.COL_PASSWORD)
                 decoder["Protocol"] = "TCP" if protocol == "NETIP" else protocol
@@ -4018,12 +5330,15 @@ class DigitalChannelsDialog(QDialog):
                 decoder.setdefault("TransModel", 0)
                 entry["Decoder"] = [decoder]
             config.append(entry)
+        time_syn = self._merge_row_entries(
+            self._time_syn, time_syn_by_row, "TimeSyn", rows)
+        decode_param = self._merge_row_entries(
+            self._decode_param, decode_param_by_row, "deleyTimeMs", rows)
         return {
             "channels": config,
             "titles": titles + list(self._titles[table.rowCount():]),
-            "time_syn": self._merge_entries(self._time_syn, time_syn, "TimeSyn"),
-            "decode_param": self._merge_entries(
-                self._decode_param, decode_param, "deleyTimeMs"),
+            "time_syn": time_syn,
+            "decode_param": decode_param,
         }
 
     @staticmethod
@@ -4064,10 +5379,39 @@ class DigitalChannelsDialog(QDialog):
             },
         }
 
+    @staticmethod
+    def _gateway_on_subnet(new_ip, subnet, gateway):
+        """Keep the gateway in new_ip's subnet, preserving its host bits."""
+        try:
+            network = ipaddress.IPv4Network(
+                "%s/%s" % (new_ip, subnet), strict=False)
+        except (ipaddress.AddressValueError, ValueError):
+            return gateway
+        try:
+            old = ipaddress.IPv4Address(str(gateway or "").strip())
+        except (ipaddress.AddressValueError, ValueError):
+            old = None
+        if old is not None and old in network:
+            return str(old)
+        host = (int(old) & ~int(network.netmask)) if old is not None else 1
+        base = int(network.network_address)
+        for offset in (host, 1, 254, 2):
+            value = base + offset
+            if value > 0xFFFFFFFF:
+                continue
+            candidate = ipaddress.IPv4Address(value)
+            if (candidate in network
+                    and candidate != network.network_address
+                    and candidate != network.broadcast_address
+                    and candidate != ipaddress.IPv4Address(new_ip)):
+                return str(candidate)
+        return gateway
+
     def _dig_defaults(self, new_ip):
         subnet = self._valid_ip(self._subnet, "255.255.255.0")
-        gateway = self._valid_ip(self._gateway, new_ip.rsplit(".", 1)[0] + ".1")
-        return subnet, gateway
+        gateway = self._valid_ip(
+            self._gateway, new_ip.rsplit(".", 1)[0] + ".1")
+        return subnet, self._gateway_on_subnet(new_ip, subnet, gateway)
 
     def _build_dig_ip_payload_for_device(self, device, new_ip, row):
         entry = (self._remote_entries[row]
@@ -4169,7 +5513,11 @@ class DigitalChannelsDialog(QDialog):
         reply = payload.get("OPDIGSetIP") if isinstance(payload, dict) else None
         ret = reply.get("Ret") if isinstance(reply, dict) else None
         if ret != 100:
-            self._provision_retry(job, "Ret=%s" % ret)
+            reason = self._error_text(ret)
+            if self._is_auth_failure(reason):
+                self._provision_failed(job, reason)
+            else:
+                self._provision_retry(job, reason)
             return
         self._prov_done += 1
         device = job["device"]
@@ -4201,10 +5549,17 @@ class DigitalChannelsDialog(QDialog):
                 "%s failed (%s) — retry %d/%d ..." % (
                     label, reason, attempts + 1, self.NUMBER_ATTEMPTS))
         else:
-            self._prov_failed += 1
-            self._set_search_row_brush(
-                job["search_key"], PROVISION_FAILED_BRUSH)
-            self.provision_status.setText("%s failed: %s" % (label, reason))
+            self._provision_failed(
+                job, reason, timeout=self._is_timeout_failure(reason))
+
+    def _provision_failed(self, job, reason, timeout=False):
+        """Finish a provisioning job: red for errors, yellow for timeouts."""
+        self._prov_failed += 1
+        brush = PROVISION_ACTIVE_BRUSH if timeout else PROVISION_FAILED_BRUSH
+        self._set_search_row_brush(job["search_key"], brush)
+        self.provision_status.setText(
+            "%s %s: %s" % (job["search_key"],
+                           "timed out" if timeout else "failed", reason))
 
     def _apply_channels(self):
         self._start(
@@ -4222,6 +5577,21 @@ class DigitalChannelsDialog(QDialog):
                                 "Apply failed: " + ", ".join(failures))
             return
         self._reload_pending = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        screen = self.screen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame = max(0, self.frameGeometry().height() - self.height())
+        self.resize(self.width(), max(self.minimumHeight(),
+                                      available.height() - frame))
+        geometry = self.frameGeometry()
+        x = min(max(geometry.x(), available.left()),
+                max(available.left(),
+                    available.right() - geometry.width() + 1))
+        self.move(x, available.top())
 
     def closeEvent(self, event):
         self._prov_active = False
@@ -4282,6 +5652,11 @@ class LiveStreamDevice(QIODevice):
         with self._condition:
             self._buffer.clear()
             self._ended = False
+            self._condition.notify_all()
+
+    def clear(self):
+        with self._condition:
+            self._buffer.clear()
             self._condition.notify_all()
 
     def isSequential(self):
@@ -4480,10 +5855,76 @@ class PyAvDecoder(QObject):
                 self.failed.emit("PyAV: %s" % error)
 
 
+class StreamRecorder(QObject):
+    """Write the raw NETIP elementary stream to disk while playing."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._handle = None
+        self._path = ""
+        self._bytes = 0
+        self._wait_keyframe = False
+        self._lock = threading.Lock()
+
+    def start(self, path, wait_keyframe=True):
+        self.stop()
+        try:
+            handle = open(path, "wb")
+        except OSError as error:
+            return error
+        with self._lock:
+            self._handle = handle
+            self._path = path
+            self._bytes = 0
+            self._wait_keyframe = bool(wait_keyframe)
+        return None
+
+    @property
+    def is_recording(self):
+        with self._lock:
+            return self._handle is not None
+
+    def feed(self, data, keyframe=False):
+        with self._lock:
+            handle = self._handle
+            if handle is None:
+                return
+            if self._wait_keyframe:
+                if not keyframe:
+                    return
+                self._wait_keyframe = False
+            try:
+                handle.write(data)
+            except OSError:
+                self._close_locked()
+                return
+            self._bytes += len(data)
+
+    def stop(self):
+        with self._lock:
+            return self._close_locked()
+
+    def _close_locked(self):
+        handle = self._handle
+        self._handle = None
+        path = self._path
+        size = self._bytes
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        if path:
+            return path, size
+        return None
+
+
 class VideoPanel(QWidget):
     status_changed = Signal(str)
     keyframe = Signal()
-    frame_in = Signal(object, object)
+    notice = Signal(str)
+    lost = Signal(str)
+    frame_in = Signal(object, object, object)
     jpeg_in = Signal(object)
     audio_in = Signal(object)
 
@@ -4509,7 +5950,17 @@ class VideoPanel(QWidget):
         self._qt_codec = None
         self._fallback_started = False
         self._active = False
+        self._media_generation = 0
         self._retired_devices = []
+        self._preroll_active = False
+        self._preroll_frames = []
+        self._preroll_keyframe = b""
+        self._preroll_timer = QTimer(self)
+        self._preroll_timer.setSingleShot(True)
+        self._preroll_timer.timeout.connect(self._flush_preroll)
+        self._preroll_feed_timer = QTimer(self)
+        self._preroll_feed_timer.setInterval(20)
+        self._preroll_feed_timer.timeout.connect(self._feed_preroll)
         self.codec = None
         self._backend = self._choose_backend()
 
@@ -4532,10 +5983,23 @@ class VideoPanel(QWidget):
         self.mute_check.toggled.connect(self._on_mute)
         self.volume_slider.valueChanged.connect(self._on_volume)
 
+        self.record_button = QPushButton("REC")
+        self.record_button.setCheckable(True)
+        self.record_button.setToolTip(
+            "Save the incoming stream to a file while watching.")
+        self.record_button.toggled.connect(self._toggle_recording)
+        self.record_label = QLabel("")
+        self.record_label.setStyleSheet(
+            "color: #C62828; font-weight: bold;")
+        self._recorder = StreamRecorder(self)
+
         controls = QHBoxLayout()
         controls.setContentsMargins(2, 0, 2, 0)
         controls.addWidget(self.mute_check)
         controls.addWidget(self.volume_slider)
+        controls.addSpacing(8)
+        controls.addWidget(self.record_button)
+        controls.addWidget(self.record_label)
         controls.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -4548,6 +6012,7 @@ class VideoPanel(QWidget):
         if self._player is not None and self.video_widget is not None:
             self._player.setVideoOutput(self.video_widget)
             self._player.errorOccurred.connect(self._on_qt_error)
+            self._player.mediaStatusChanged.connect(self._on_qt_media_status)
             sink = self._player.videoSink()
             if sink is not None:
                 sink.videoFrameChanged.connect(self._on_video_frame)
@@ -4596,13 +6061,13 @@ class VideoPanel(QWidget):
         elif self._backend == "av" and self._av_decoder is not None:
             self._av_decoder.restart()
 
-    def feed(self, data, codec):
+    def feed(self, data, codec, keyframe=False):
         if codec:
             self.codec = codec
         self._decoded += 1
-        self.frame_in.emit(bytes(data), codec)
+        self.frame_in.emit(bytes(data), codec, bool(keyframe))
 
-    def push_jpeg(self, data):
+    def push_jpeg(self, data, keyframe=False):
         self._decoded += 1
         self.jpeg_in.emit(bytes(data))
 
@@ -4611,9 +6076,10 @@ class VideoPanel(QWidget):
 
     # -- queued handlers (GUI thread) --------------------------------------
 
-    def _handle_frame_in(self, data, codec):
+    def _handle_frame_in(self, data, codec, keyframe=False):
         if not self._active:
             return
+        self._recorder.feed(data, keyframe)
         if self._backend == "qt":
             if self._player is None:
                 return
@@ -4622,6 +6088,11 @@ class VideoPanel(QWidget):
                 if codec:
                     self._qt_codec = codec
                 self._restart_qt_source()
+                if keyframe:
+                    self._begin_preroll(data)
+            if self._preroll_active:
+                self._preroll_frames.append(bytes(data))
+                return
             if self._stream_device is not None:
                 self._stream_device.feed(data)
         elif self._backend == "av" and self._av_decoder is not None:
@@ -4632,6 +6103,7 @@ class VideoPanel(QWidget):
     def _handle_jpeg_in(self, data):
         if not self._active:
             return
+        self._recorder.feed(data, True)
         image = QImage.fromData(data, "JPG")
         if image.isNull():
             return
@@ -4642,6 +6114,63 @@ class VideoPanel(QWidget):
             return
         if self._audio is not None:
             self._audio.feed(data)
+
+    def _begin_preroll(self, keyframe):
+        """Prime Qt's FFmpeg probe with keyframes so it loads instantly.
+
+        Qt's FFmpeg loader waits for about 2.5 s of media before it reports
+        LoadedMedia.  On a live source that delay lands playback in the
+        middle of a GOP (choppy until the next keyframe).  Feeding copies of
+        the current I-frame satisfies the probe immediately; the real frames
+        are held until the loader is done, then replayed from the keyframe.
+        """
+        self._preroll_timer.stop()
+        self._preroll_feed_timer.stop()
+        self._preroll_active = False
+        self._preroll_frames = []
+        self._preroll_keyframe = bytes(keyframe or b"")
+        device = self._stream_device
+        if device is None or not self._preroll_keyframe:
+            return
+        self._preroll_active = True
+        for _ in range(32):
+            device.feed(self._preroll_keyframe)
+        self._preroll_feed_timer.start()
+        self._preroll_timer.start(4000)
+
+    def _feed_preroll(self):
+        if not self._preroll_active:
+            self._preroll_feed_timer.stop()
+            return
+        device = self._stream_device
+        if device is None:
+            self._flush_preroll()
+            return
+        for _ in range(6):
+            device.feed(self._preroll_keyframe)
+
+    def _on_qt_media_status(self, status):
+        if not self._preroll_active:
+            return
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia,
+                      QMediaPlayer.MediaStatus.BufferingMedia,
+                      QMediaPlayer.MediaStatus.BufferedMedia):
+            self._flush_preroll()
+
+    def _flush_preroll(self):
+        if not self._preroll_active:
+            return
+        self._preroll_active = False
+        self._preroll_timer.stop()
+        self._preroll_feed_timer.stop()
+        device = self._stream_device
+        frames = self._preroll_frames
+        self._preroll_frames = []
+        if device is None:
+            return
+        device.clear()
+        for data in frames:
+            device.feed(data)
 
     def _restart_qt_source(self):
         if self._player is None:
@@ -4702,6 +6231,8 @@ class VideoPanel(QWidget):
             self._show_image(image)
 
     def _on_decoder_failed(self, text):
+        if not self._active:
+            return
         self._set_status("Error: %s" % text)
 
     def _set_status(self, text):
@@ -4729,12 +6260,18 @@ class VideoPanel(QWidget):
         self._qt_codec = None
         self.codec = None
         self._decoded = 0
+        self._preroll_active = False
+        self._preroll_frames = []
+        self._preroll_keyframe = b""
+        self._preroll_timer.stop()
+        self._preroll_feed_timer.stop()
         self._image = None
         self._frame_size = None
         self._last_frame_time = 0.0
         self._stack.setCurrentWidget(self.video_label)
         self.video_label.setText("waiting for video ...")
         self.video_label.setPixmap(QPixmap())
+        self._media_generation += 1
         self._decoder.reset()
         if self._av_decoder is not None:
             self._av_decoder.reset()
@@ -4744,7 +6281,8 @@ class VideoPanel(QWidget):
             rps=bool(self._device.get("rps", True)),
             port=int(self._device.get("tcp_port") or 34567),
             stream=self._stream, channel=self._channel, parent=self,
-            audio_sink=self)
+            audio_sink=self,
+            no_md5=bool(self._device.get("no_md5")))
         thread.status.connect(self._set_status)
         thread.stats.connect(self._on_stats)
         thread.failed.connect(self._on_failed)
@@ -4764,6 +6302,10 @@ class VideoPanel(QWidget):
     def switch(self, stream, channel):
         if self._thread is None:
             return False
+        if self._recorder.is_recording:
+            self._uncheck_record()
+            self._stop_recording()
+            self.notice.emit("Recording stopped for the channel switch")
         self._stream = stream
         self._channel = int(channel)
         self._switch_target = (stream, int(channel))
@@ -4785,17 +6327,43 @@ class VideoPanel(QWidget):
             self._switch_target = None
             self._switch_timer.stop()
 
-    def stop(self):
+    def stop(self, wait=False):
         self._active = False
         self._watchdog.stop()
         self._switch_timer.stop()
         self._switch_target = None
+        self._uncheck_record()
+        self._stop_recording()
+        # Hide the frame immediately and repaint now; the device/player
+        # cleanup runs afterwards and must never delay the visible change.
+        self._image = None
+        self._frame_size = None
+        self.video_label.setPixmap(QPixmap())
+        self.video_label.setText("no video")
+        self._stack.setCurrentWidget(self.video_label)
+        self._stack.repaint()
+        self._set_status("")
         thread = self._thread
         self._thread = None
         if thread is not None:
             thread.stop()
-            if thread.wait(10000):
-                thread.deleteLater()
+            if wait:
+                thread.wait(3000)
+            thread.finished.connect(thread.deleteLater)
+        self._media_generation += 1
+        if wait:
+            self._stop_media(self._media_generation)
+        else:
+            generation = self._media_generation
+            QTimer.singleShot(0, lambda: self._stop_media(generation))
+
+    def _stop_media(self, generation):
+        if generation != self._media_generation:
+            return
+        self._preroll_active = False
+        self._preroll_frames = []
+        self._preroll_timer.stop()
+        self._preroll_feed_timer.stop()
         if self._stream_device is not None:
             self._stream_device.end()
             self._stream_device = None
@@ -4807,10 +6375,6 @@ class VideoPanel(QWidget):
             self._av_decoder.stop()
         if self._audio is not None:
             self._audio.stop()
-        self.video_label.setPixmap(QPixmap())
-        self.video_label.setText("no video")
-        self._stack.setCurrentWidget(self.video_label)
-        self._set_status("")
 
     def _on_frame(self, generation, data):
         if generation != self._decoder.generation:
@@ -4845,7 +6409,11 @@ class VideoPanel(QWidget):
             self._stream, self._channel + 1, resolution, text))
 
     def _on_failed(self, text):
+        if not self._active:
+            return
         self._set_status("Error: %s" % text)
+        if is_connection_error(text):
+            self.lost.emit(str(text))
 
     def _on_finished(self):
         thread = self.sender()
@@ -4853,6 +6421,55 @@ class VideoPanel(QWidget):
             self._thread = None
         if thread is not None:
             thread.deleteLater()
+
+    def _toggle_recording(self, checked):
+        if not checked:
+            self._stop_recording()
+            return
+        if not self._active:
+            self._uncheck_record()
+            return
+        codec = self._qt_codec or self.codec or ""
+        suffix = {"h264": ".h264", "h265": ".h265", "mpeg4": ".m4v",
+                  "jpeg": ".mjpeg"}.get(codec, ".bin")
+        settings = QSettings("xmdm3", "xmdms")
+        start_dir = str(settings.value("video_dir", "", type=str) or "")
+        device = self._device if isinstance(self._device, dict) else {}
+        base = "%s_%s" % ((device.get("ip") or "stream").replace(".", "-"),
+                          time.strftime("%Y%m%d-%H%M%S"))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save stream", os.path.join(start_dir, base + suffix),
+            "Video stream (*%s);;All files (*)" % suffix)
+        if not path:
+            self._uncheck_record()
+            return
+        settings.setValue("video_dir", os.path.dirname(path))
+        error = self._recorder.start(path, wait_keyframe=(codec != "jpeg"))
+        if error is not None:
+            self._uncheck_record()
+            self.notice.emit("Cannot save stream: %s" % error)
+            return
+        self.record_label.setText("REC")
+        self.notice.emit("Saving stream to %s" % path)
+
+    def _stop_recording(self):
+        result = self._recorder.stop()
+        self.record_label.setText("")
+        if result is None:
+            return
+        path, size = result
+        if size >= 1048576:
+            text = "%.1f MB" % (size / 1048576.0)
+        elif size >= 1024:
+            text = "%.1f KB" % (size / 1024.0)
+        else:
+            text = "%d B" % size
+        self.notice.emit("Stream saved: %s (%s)" % (path, text))
+
+    def _uncheck_record(self):
+        self.record_button.blockSignals(True)
+        self.record_button.setChecked(False)
+        self.record_button.blockSignals(False)
 
     def _on_mute(self, checked):
         if self._audio is not None:
@@ -4965,12 +6582,24 @@ class MainWindow(QMainWindow):
         self.resize(1280, 560)
         self._thread = None
         self._ipset_thread = None
+        self._session_thread = None
+        self._ipset_target = None
+        self._search_seen = set()
+        self._search_devices = {}
+        self._search_error = False
+        self._pass_thread = None
+        self._pass_queue = []
+        self._pass_active = False
+        self._pass_total = 0
+        self._pass_done = 0
+        self._pass_failed = 0
         self._probe_thread = None
         self._netip_thread = None
         self._network_thread = None
         self._pending_network = None
         self._network_dhcp_config = []
         self._channels_dialog = None
+        self._snapshot_windows = []
         self._console_dialog = None
         self._video_device = None
         self._video_credentials = ("admin", "")
@@ -4980,6 +6609,7 @@ class MainWindow(QMainWindow):
         self._fetched_keys = set()
         self._pending_fetch_keys = set()
         self._fetch_in_progress = False
+        self._system_error = False
         self._channel_count = 0
         self._stale_threads = []
         self._connect_pending = None
@@ -5008,10 +6638,10 @@ class MainWindow(QMainWindow):
         self.user_edit = QLineEdit("admin")
         self.user_edit.setMaximumWidth(110)
         self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        configure_password_edit(self.password_edit)
         self.password_edit.setMaximumWidth(100)
         self.new_password_edit = QLineEdit()
-        self.new_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        configure_password_edit(self.new_password_edit)
         self.new_password_edit.setMaximumWidth(100)
 
         self.initial_ip_edit = IpAddressEdit()
@@ -5049,6 +6679,11 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.password_edit)
         controls.addWidget(QLabel("New password:"))
         controls.addWidget(self.new_password_edit)
+        self.change_button = QPushButton("Change")
+        self.change_button.setToolTip(
+            "Change the password on all checked devices (or the selected one).")
+        self.change_button.clicked.connect(self._change_passwords)
+        controls.addWidget(self.change_button)
         controls.addWidget(QLabel("Start IP:"))
         controls.addWidget(self.initial_ip_edit)
         controls.addWidget(self.number_button)
@@ -5102,13 +6737,14 @@ class MainWindow(QMainWindow):
         self.video_button = QPushButton("START VIDEO")
         self.video_button.clicked.connect(self._toggle_video)
 
-        self.stream_combo = QComboBox()
-        self.stream_combo.addItem("Main stream", 0)
-        self.stream_combo.addItem("Sub stream", 1)
+        self.stream_main_radio = QRadioButton("Main")
+        self.stream_sub_radio = QRadioButton("Sub")
+        self.stream_main_radio.setChecked(True)
         self.channel_combo = QComboBox()
         self._set_channel_count(16)
-        self.stream_combo.currentIndexChanged.connect(self._video_source_changed)
         self.channel_combo.currentIndexChanged.connect(self._video_source_changed)
+        self.stream_main_radio.toggled.connect(self._stream_radio_changed)
+        self.stream_sub_radio.toggled.connect(self._stream_radio_changed)
 
         bottom = QHBoxLayout()
         bottom.addWidget(self.search_button)
@@ -5117,10 +6753,11 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.rtsp_button)
         bottom.addWidget(self.snap_button)
         bottom.addWidget(self.video_button)
-        bottom.addWidget(QLabel("Stream type:"))
-        bottom.addWidget(self.stream_combo)
         bottom.addWidget(QLabel("Channel:"))
         bottom.addWidget(self.channel_combo)
+        bottom.addWidget(QLabel("Stream:"))
+        bottom.addWidget(self.stream_main_radio)
+        bottom.addWidget(self.stream_sub_radio)
         bottom.addStretch(1)
 
         self.video_panel = VideoPanel()
@@ -5203,8 +6840,14 @@ class MainWindow(QMainWindow):
         self._network_ntp_config = {}
         self.network_wifi_ssid_edit = QComboBox()
         self.network_wifi_ssid_edit.setEditable(True)
+        self.network_wifi_ssid_edit.activated.connect(
+            self._wifi_ssid_activated)
+        self.network_wifi_scan_button = QPushButton("Scan")
+        self.network_wifi_scan_button.setToolTip(
+            "Scan for Wi-Fi networks on the device.")
+        self.network_wifi_scan_button.clicked.connect(self._wifi_scan)
         self.network_wifi_password_edit = QLineEdit()
-        self.network_wifi_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        configure_password_edit(self.network_wifi_password_edit)
         self.network_wifi_auth_combo = QComboBox()
         self.network_wifi_auth_combo.addItems(
             ["OPEN", "SHARED", "WEPAUTO", "WPAPSK", "WPA2PSK", "WPANONE", "WPA", "WPA2"])
@@ -5310,7 +6953,12 @@ class MainWindow(QMainWindow):
         wifi_grid.setHorizontalSpacing(6)
         wifi_grid.setVerticalSpacing(3)
         wifi_grid.addWidget(QLabel("SSID:"), 1, 0)
-        wifi_grid.addWidget(self.network_wifi_ssid_edit, 1, 1)
+        ssid_row = QHBoxLayout()
+        ssid_row.setContentsMargins(0, 0, 0, 0)
+        ssid_row.setSpacing(4)
+        ssid_row.addWidget(self.network_wifi_ssid_edit, 1)
+        ssid_row.addWidget(self.network_wifi_scan_button)
+        wifi_grid.addLayout(ssid_row, 1, 1)
         wifi_grid.addWidget(QLabel("Pass:"), 2, 0)
         wifi_grid.addWidget(self.network_wifi_password_edit, 2, 1)
         wifi_modes = QHBoxLayout()
@@ -5327,6 +6975,7 @@ class MainWindow(QMainWindow):
         upgrade_group = QGroupBox("Upgrade")
         upgrade_group.setCheckable(True)
         upgrade_group.setStyleSheet(GROUP_BOX_STYLE)
+        upgrade_group.toggled.connect(self._update_upgrade_controls)
         self.upgrade_group = upgrade_group
         upgrade_grid = QGridLayout(upgrade_group)
         upgrade_grid.setHorizontalSpacing(6)
@@ -5420,13 +7069,21 @@ class MainWindow(QMainWindow):
         self.settings_theme_combo = QComboBox()
         self.settings_theme_combo.addItems(["Auto", "Light", "Dark"])
         self.settings_theme_combo.currentTextChanged.connect(self._theme_changed)
+        self.settings_passwords_combo = QComboBox()
+        self.settings_passwords_combo.addItems(["Show", "Hide"])
+        self.settings_passwords_combo.setCurrentText(
+            "Show" if passwords_visible() else "Hide")
+        self.settings_passwords_combo.currentTextChanged.connect(
+            self._passwords_changed)
         settings_layout = QGridLayout()
         settings_layout.addWidget(QLabel("Search timeout:"), 0, 0)
         settings_layout.addWidget(self.settings_timeout_spin, 0, 1)
         settings_layout.addWidget(self.settings_probe_label, 1, 0, 1, 2)
         settings_layout.addWidget(QLabel("Theme:"), 2, 0)
         settings_layout.addWidget(self.settings_theme_combo, 2, 1)
-        settings_layout.setRowStretch(3, 1)
+        settings_layout.addWidget(QLabel("Passwords:"), 3, 0)
+        settings_layout.addWidget(self.settings_passwords_combo, 3, 1)
+        settings_layout.setRowStretch(4, 1)
         settings_panel = QWidget()
         settings_panel.setLayout(settings_layout)
         self._settings_panel = settings_panel
@@ -5486,6 +7143,12 @@ class MainWindow(QMainWindow):
         self.system_hour_combo = QComboBox()
         self.system_hour_combo.addItems(["24-hour", "12-hour"])
         self.system_beeper_check = QCheckBox("Beeper")
+        self.display_face_check = QCheckBox("Face function")
+        self.display_debug_check = QCheckBox("Enable debug")
+        self.display_debug_check.setToolTip(
+            "Ability.DeviceDesc.EnableDebugMode")
+        self.display_audio_edit = QLineEdit()
+        self.display_audio_edit.setReadOnly(True)
         self._system_device_desc_config = {}
         self.system_sync_button = QPushButton("Sync time")
         self.system_sync_button.clicked.connect(self._system_sync_time)
@@ -5503,15 +7166,33 @@ class MainWindow(QMainWindow):
         self.system_logs_button.clicked.connect(self._view_logs)
         self.system_erase_logs_button = QPushButton("Erase logs")
         self.system_erase_logs_button.clicked.connect(self._erase_logs)
+        self.system_recovery_button = QPushButton("Recovery")
+        self.system_recovery_button.setToolTip(
+            "Build an XM-DVR recovery image (.img) from a firmware .bin.")
+        self.system_recovery_button.clicked.connect(self._recovery_image)
+        self.system_dump_button = QPushButton("Dump")
+        self.system_dump_button.setToolTip(
+            "Build a flash dump (.dump) from the uImages in a firmware .bin.")
+        self.system_dump_button.clicked.connect(self._dump_image)
+        self.system_open_dir_button = QPushButton("Open dir")
+        self.system_open_dir_button.setToolTip(
+            "Open the application folder (configs are saved in the cfgs "
+            "subfolder).")
+        self.system_open_dir_button.clicked.connect(self._open_app_dir)
         self._system_general_keys = {}
         metrics = self.fontMetrics()
 
-        def field_block(label, widget, sample=None, minimum=60):
+        def field_width(label, widget, sample=None, minimum=60):
             label_widget = QLabel(label)
             width = max(label_widget.sizeHint().width(), minimum)
             if sample:
                 extra = 30 if isinstance(widget, QComboBox) else 10
                 width = max(width, metrics.horizontalAdvance(sample) + extra)
+            return width
+
+        def field_block(label, widget, sample=None, minimum=60):
+            label_widget = QLabel(label)
+            width = field_width(label, widget, sample, minimum)
             widget.setMinimumWidth(width)
             widget.setMaximumWidth(width)
             block = QVBoxLayout()
@@ -5522,7 +7203,9 @@ class MainWindow(QMainWindow):
 
         for button in (self.system_import_button, self.system_export_button,
                        self.system_reset_button, self.system_logs_button,
-                       self.system_erase_logs_button):
+                       self.system_erase_logs_button,
+                       self.system_recovery_button, self.system_dump_button,
+                       self.system_open_dir_button):
             button.setMaximumWidth(84)
 
         info_grid = QGridLayout()
@@ -5576,6 +7259,9 @@ class MainWindow(QMainWindow):
         media_row.addLayout(field_block("TV standard:", self.system_tv_combo, sample="NTSC"))
         media_row.addLayout(field_block(
             "Language:", self.system_language_combo, sample="Russian"))
+        language_width = round(self.system_language_combo.maximumWidth() * 1.2)
+        self.system_language_combo.setMinimumWidth(language_width)
+        self.system_language_combo.setMaximumWidth(language_width)
         media_row.addLayout(field_block(
             "Restart day:", self.system_restart_day_combo, sample="Wednesday"))
         media_row.addLayout(field_block(
@@ -5598,11 +7284,40 @@ class MainWindow(QMainWindow):
         format_row.addStretch(1)
         general_grid.addLayout(format_row, 1, 0)
 
-        checkbox_grid = QGridLayout()
-        checkbox_grid.setHorizontalSpacing(6)
-        checkbox_grid.setVerticalSpacing(3)
-        checkbox_grid.addWidget(self.system_beeper_check, 0, 0)
-        general_grid.addLayout(checkbox_grid, 2, 0)
+        format_widths = (
+            field_width("Time zone:", self.system_timezone_combo, "UTC+03:30"),
+            field_width("Date format:", self.system_date_combo, "YYMMDD"),
+            field_width("Separator:", self.system_separator_combo, "W"),
+            field_width("Format:", self.system_hour_combo, "24-hour"),
+            field_width("MaxChannels:", self.system_maxchannels_combo, "000", 50),
+        )
+        row_left = general_grid.contentsMargins().left() + 1
+        format_right = (row_left + sum(format_widths)
+                        + 4 * (len(format_widths) - 1))
+        maxchannels_left = format_right - format_widths[-1]
+
+        audio_label = QLabel("AudioIn:")
+        audio_block = QVBoxLayout()
+        audio_block.setSpacing(1)
+        audio_block.addWidget(audio_label)
+        audio_block.addWidget(self.display_audio_edit)
+        self.display_audio_edit.setFixedWidth(format_widths[-1])
+
+        checkbox_row = QHBoxLayout()
+        checkbox_row.setSpacing(6)
+        checkbox_row.addWidget(
+            self.system_beeper_check, 0, Qt.AlignmentFlag.AlignBottom)
+        checkbox_row.addWidget(
+            self.display_face_check, 0, Qt.AlignmentFlag.AlignBottom)
+        checkbox_row.addWidget(
+            self.display_debug_check, 0, Qt.AlignmentFlag.AlignBottom)
+        used_left = (row_left + self.system_beeper_check.sizeHint().width()
+                     + 6 + self.display_face_check.sizeHint().width()
+                     + 6 + self.display_debug_check.sizeHint().width() + 6)
+        checkbox_row.addSpacing(max(0, maxchannels_left - used_left))
+        checkbox_row.addLayout(audio_block)
+        checkbox_row.addStretch(1)
+        general_grid.addLayout(checkbox_row, 2, 0)
         general_grid.setColumnStretch(0, 1)
 
         info_group = QGroupBox("Info")
@@ -5612,22 +7327,44 @@ class MainWindow(QMainWindow):
         general_group.setStyleSheet(GROUP_BOX_STYLE)
         general_group.setLayout(general_grid)
 
-        buttons_grid = QGridLayout()
-        buttons_grid.setHorizontalSpacing(6)
-        buttons_grid.addWidget(self.system_sync_button, 0, 0)
-        buttons_grid.addWidget(self.system_channels_button, 1, 0)
-        buttons_grid.addWidget(self.system_reboot_button, 2, 0)
-        buttons_grid.addWidget(self.system_import_button, 0, 1)
-        buttons_grid.addWidget(self.system_export_button, 1, 1)
-        buttons_grid.addWidget(self.system_reset_button, 2, 1)
-        buttons_grid.addWidget(self.system_logs_button, 3, 1)
-        buttons_grid.addWidget(self.system_erase_logs_button, 4, 1)
-        buttons_grid.setColumnStretch(0, 1)
+        left_buttons = QVBoxLayout()
+        left_buttons.setSpacing(6)
+        left_buttons.addWidget(self.system_sync_button)
+        left_buttons.addWidget(self.system_channels_button)
+        left_buttons.addWidget(self.system_reboot_button)
+        self.system_qr_label = QLabel()
+        self.system_qr_label.setFixedSize(210, 210)
+        self.system_qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.system_qr_label.setStyleSheet(
+            "background-color: white; border: 1px solid #BDBDBD;")
+        self.system_qr_label.setVisible(False)
+        left_buttons.addSpacing(8)
+        left_buttons.addWidget(
+            self.system_qr_label, 0, Qt.AlignmentFlag.AlignHCenter)
+        left_buttons.addStretch(1)
+        self.system_cloud_edit.textChanged.connect(self._update_cloud_qr)
+
+        right_buttons = QGridLayout()
+        right_buttons.setHorizontalSpacing(6)
+        right_buttons.addWidget(self.system_import_button, 0, 0)
+        right_buttons.addWidget(self.system_export_button, 1, 0)
+        right_buttons.addWidget(self.system_reset_button, 2, 0)
+        right_buttons.addWidget(self.system_logs_button, 3, 0)
+        right_buttons.addWidget(self.system_erase_logs_button, 4, 0)
+        right_buttons.addWidget(self.system_recovery_button, 5, 0)
+        right_buttons.addWidget(self.system_dump_button, 6, 0)
+        right_buttons.addWidget(self.system_open_dir_button, 7, 0)
+        self.system_buttons_grid = right_buttons
+
+        buttons_area = QHBoxLayout()
+        buttons_area.setSpacing(6)
+        buttons_area.addLayout(left_buttons, 1)
+        buttons_area.addLayout(right_buttons, 0)
 
         system_layout = QVBoxLayout()
         system_layout.addWidget(info_group)
         system_layout.addWidget(general_group)
-        system_layout.addLayout(buttons_grid)
+        system_layout.addLayout(buttons_area)
         system_layout.addStretch(1)
         system_panel = QWidget()
         system_panel.setLayout(system_layout)
@@ -5635,14 +7372,14 @@ class MainWindow(QMainWindow):
 
         self.display_resolution_combo = QComboBox()
         self.display_resolution_combo.setEditable(True)
+        self.display_resolution_combo.setMinimumContentsLength(16)
+        self.display_resolution_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
         self._display_video_out_config = {}
         self._display_gui_checks = {}
         self.display_window_alpha_spin = QSpinBox()
         self.display_window_alpha_spin.setRange(0, 255)
         self._display_gui_set_config = {}
-        self.display_face_check = QCheckBox("Face function")
-        self.display_audio_edit = QLineEdit()
-        self.display_audio_edit.setReadOnly(True)
 
         video_out_group = QGroupBox("Video out")
         video_out_group.setStyleSheet(GROUP_BOX_STYLE)
@@ -5667,18 +7404,9 @@ class MainWindow(QMainWindow):
         alpha_row.addStretch(1)
         gui_grid.addLayout(alpha_row, (len(GUI_SET_KEYS) + 1) // 2, 0, 1, 2)
 
-        ability_group = QGroupBox("Ability")
-        ability_group.setStyleSheet(GROUP_BOX_STYLE)
-        ability_layout = QHBoxLayout(ability_group)
-        ability_layout.addWidget(self.display_face_check)
-        ability_layout.addWidget(QLabel("Audio in channels:"))
-        ability_layout.addWidget(self.display_audio_edit)
-        ability_layout.addStretch(1)
-
         display_layout = QVBoxLayout()
         display_layout.addWidget(video_out_group)
         display_layout.addWidget(gui_group)
-        display_layout.addWidget(ability_group)
         display_layout.addStretch(1)
         display_panel = QWidget()
         display_panel.setLayout(display_layout)
@@ -5697,6 +7425,7 @@ class MainWindow(QMainWindow):
         self._encode_current = None
         self._encode_max_fps = 25
         self._encode_resolution_names = []
+        self._encode_channel_names = []
 
         encode_grid = QGridLayout()
         encode_grid.setHorizontalSpacing(8)
@@ -5734,17 +7463,28 @@ class MainWindow(QMainWindow):
         encode_grid.addWidget(self.encode_widgets["sub"]["smart"], row, 2)
         encode_grid.setRowStretch(row + 1, 1)
 
+        self.encode_summary_group = QGroupBox("Channels")
+        self.encode_summary_group.setStyleSheet(GROUP_BOX_STYLE)
+        self.encode_summary_grid = QGridLayout(self.encode_summary_group)
+        self.encode_summary_grid.setContentsMargins(4, 4, 4, 4)
+        self.encode_summary_grid.setHorizontalSpacing(10)
+        self.encode_summary_grid.setVerticalSpacing(2)
+        self.encode_summary_group.setVisible(False)
+
         encode_panel = QWidget()
         encode_layout = QVBoxLayout(encode_panel)
         encode_layout.setContentsMargins(4, 4, 4, 4)
         encode_layout.addLayout(encode_grid)
+        encode_layout.addWidget(self.encode_summary_group)
         encode_layout.addStretch(1)
         self.tabs.addTab(encode_panel, "Encode")
 
         self.camera_channel_combo = QComboBox()
         self.camera_channel_combo.currentIndexChanged.connect(self._camera_channel_changed)
         self.camera_widgets = {}
+        self.camera_ex_widgets = {}
         self._camera_configs = []
+        self._camera_ex_configs = []
         self._white_light_configs = []
         self._camera_indexed = False
         self._camera_current = None
@@ -5773,10 +7513,6 @@ class MainWindow(QMainWindow):
             ("Night NF level", "Night_nfLevel", "spin", (0, 5)),
             ("IR-CUT mode", "IRCUTMode", "combo",
              (("Sync switch", 0), ("Auto switch", 1))),
-            ("IR-CUT swap", "IrcutSwap", "check", None),
-            ("Flip", "PictureFlip", "check", None),
-            ("Mirror", "PictureMirror", "check", None),
-            ("Reject flicker", "RejectFlicker", "check", None),
             ("DNC threshold", "DncThr", "spin", (0, 100)),
         )
         for index, (label, key, kind, extra) in enumerate(camera_fields):
@@ -5796,7 +7532,53 @@ class MainWindow(QMainWindow):
             camera_grid.addWidget(widget, row, column + 1)
         camera_grid.setColumnStretch(1, 1)
         camera_grid.setColumnStretch(3, 1)
-        camera_grid.setRowStretch(1 + (len(camera_fields) + 1) // 2, 1)
+
+        ex_row = 1 + (len(camera_fields) + 1) // 2
+        automatic = QSpinBox()
+        automatic.setRange(1, 5)
+        automatic.setToolTip("Camera.ParamEx.AutomaticAdjustment")
+        self.camera_ex_widgets["AutomaticAdjustment"] = automatic
+        style = QComboBox()
+        for text, value in (("Style 1", "typedefault"),
+                            ("Style 2", "style1"),
+                            ("Style 3", "style2")):
+            style.addItem(text, value)
+        style.setToolTip("Camera.ParamEx.Style")
+        self.camera_ex_widgets["Style"] = style
+        camera_grid.addWidget(QLabel("DN switch:"), ex_row, 0)
+        camera_grid.addWidget(automatic, ex_row, 1)
+        camera_grid.addWidget(QLabel("Style:"), ex_row, 2)
+        camera_grid.addWidget(style, ex_row, 3)
+
+        dwdr = QCheckBox()
+        dwdr.setToolTip("Camera.ParamEx.BroadTrends.AutoGain")
+        self.camera_ex_widgets["DWDR"] = dwdr
+        dwdr_gain = QSpinBox()
+        dwdr_gain.setRange(0, 100)
+        dwdr_gain.setToolTip("Camera.ParamEx.BroadTrends.Gain")
+        self.camera_ex_widgets["DWDRGain"] = dwdr_gain
+        dwdr_row = ex_row + 1
+        dwdr_box = QWidget()
+        dwdr_layout = QHBoxLayout(dwdr_box)
+        dwdr_layout.setContentsMargins(0, 0, 0, 0)
+        dwdr_layout.setSpacing(6)
+        dwdr_layout.addWidget(dwdr)
+        dwdr_layout.addWidget(QLabel("Strength:"))
+        dwdr_layout.addWidget(dwdr_gain)
+        dwdr_layout.addStretch(1)
+        camera_grid.addWidget(QLabel("DWDR:"), dwdr_row, 0)
+        camera_grid.addWidget(dwdr_box, dwdr_row, 1, 1, 3)
+        camera_grid.setRowStretch(dwdr_row + 1, 1)
+
+        image_layout = QHBoxLayout()
+        for key, label in (("PictureFlip", "Flip"),
+                           ("PictureMirror", "Mirror"),
+                           ("IrcutSwap", "IR-CUT swap"),
+                           ("RejectFlicker", "Reject flicker")):
+            box = QCheckBox(label)
+            self.camera_widgets[key] = box
+            image_layout.addWidget(box)
+        image_layout.addStretch(1)
         self.white_light_widgets = {}
         white_group = QGroupBox("White light")
         white_group.setStyleSheet(GROUP_BOX_STYLE)
@@ -5840,12 +7622,14 @@ class MainWindow(QMainWindow):
         camera_layout = QVBoxLayout(camera_panel)
         camera_layout.setContentsMargins(4, 4, 4, 4)
         camera_layout.addLayout(camera_grid)
+        camera_layout.addLayout(image_layout)
         camera_layout.addWidget(white_group)
         camera_layout.addStretch(1)
         self.tabs.addTab(camera_panel, "Camera")
 
         self.storage_table = QTableWidget(0, len(STORAGE_COLUMNS))
         self.storage_table.setHorizontalHeaderLabels(STORAGE_COLUMNS)
+        install_copy_menu(self.storage_table)
         self.storage_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.storage_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.storage_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -5988,6 +7772,7 @@ class MainWindow(QMainWindow):
 
         self.users_table = QTableWidget(0, 3)
         self.users_table.setHorizontalHeaderLabels(("No", "Name", "Group"))
+        install_copy_menu(self.users_table)
         self.users_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.users_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.users_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -6003,6 +7788,7 @@ class MainWindow(QMainWindow):
 
         self.groups_table = QTableWidget(0, 2)
         self.groups_table.setHorizontalHeaderLabels(("No", "Group"))
+        install_copy_menu(self.groups_table)
         self.groups_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.groups_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.groups_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -6135,8 +7921,11 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.connection_label)
         self.status_bar.addPermanentWidget(status_widget, 1)
         self.video_panel.status_changed.connect(self._on_video_status)
+        self.video_panel.notice.connect(self._message)
+        self.video_panel.lost.connect(self._on_video_lost)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self._disable_device_tabs()
+        load_private_extension(self)
 
     def _message(self, text):
         self.fetch_label.setText(text)
@@ -6173,11 +7962,18 @@ class MainWindow(QMainWindow):
             duration=self.settings_timeout_spin.value(), parent=self)
         thread.device_found.connect(self._on_device_found)
         thread.status_changed.connect(self._set_status)
-        thread.failed.connect(self._on_failed)
+        thread.failed.connect(self._on_search_failed)
         thread.finished.connect(self._on_search_finished)
         self._thread = thread
+        self._search_seen = set()
+        self._search_devices = {}
+        self._search_error = False
         self._set_status("Searching")
         thread.start()
+
+    def _on_search_failed(self, text):
+        self._search_error = True
+        self._on_failed(text)
 
     def _on_search_finished(self):
         thread = self.sender()
@@ -6187,8 +7983,42 @@ class MainWindow(QMainWindow):
         thread.deleteLater()
         if self.search_button.isChecked():
             self.search_button.setChecked(False)
-        self._idle_text = "Search finished"
+        removed = 0 if self._search_error else self._prune_missing_devices()
+        self._idle_text = ("Search finished — removed %d device(s)" % removed
+                           if removed else "Search finished")
         self.status_label.setText(self._refresh_status_text())
+
+    def _device_replaced_at_ip(self, device):
+        """True when another (different MAC) device answered on this IP."""
+        ip = str(device.get("ip") or "").strip()
+        if not ip:
+            return False
+        mac = str(device.get("mac") or "").strip().lower()
+        for seen in self._search_devices.values():
+            if str(seen.get("ip") or "").strip() != ip:
+                continue
+            seen_mac = str(seen.get("mac") or "").strip().lower()
+            if mac and seen_mac and seen_mac != mac:
+                return True
+        return False
+
+    def _prune_missing_devices(self):
+        """Drop broadcast devices that did not answer the last search."""
+        removed = 0
+        for row in range(self.model.rowCount() - 1, -1, -1):
+            device = self.model.device_at(row)
+            if not isinstance(device, dict) or device.get("manual"):
+                continue
+            identity = DeviceTableModel.identity(device)
+            if identity in self._search_seen:
+                continue
+            if identity == self._connected_identity:
+                if not self._device_replaced_at_ip(device):
+                    continue
+                self._drop_connection()
+            self.model.remove_device(row)
+            removed += 1
+        return removed
 
     def _stop_search(self):
         thread = self._thread
@@ -6219,8 +8049,88 @@ class MainWindow(QMainWindow):
                 self._start_search()
 
     def _on_device_found(self, device):
+        if isinstance(device, dict):
+            identity = DeviceTableModel.identity(device)
+            self._search_seen.add(identity)
+            self._search_devices[identity] = device
         self.model.upsert(device)
         self.status_label.setText(self._refresh_status_text())
+
+    def _wifi_scan(self):
+        device = self._system_target()
+        if not isinstance(device, dict):
+            self._message("No device selected — pick a table row first.")
+            return
+        self._start_system_action(
+            "wifi_scan", device=device, label="Scanning Wi-Fi on",
+            on_fetched=self._on_wifi_scan)
+
+    def _on_wifi_scan(self, payload):
+        reply = payload.get("wifi_scan") if isinstance(payload, dict) else None
+        info = reply.get("WifiAP") if isinstance(reply, dict) else None
+        if isinstance(info, dict):
+            entries = info.get("WifiAP")
+        elif isinstance(info, list):
+            entries = info
+        else:
+            entries = None
+        if not isinstance(entries, list):
+            self._message("Wi-Fi scan returned no networks.")
+            return
+        combo = self.network_wifi_ssid_edit
+        current = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        count = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            ssid = str(entry.get("SSID") or "").strip()
+            if not ssid:
+                continue
+            combo.addItem(ssid)
+            index = combo.count() - 1
+            combo.setItemData(index, entry, Qt.ItemDataRole.UserRole)
+            combo.setItemData(
+                index,
+                "Signal: %s | Sec: %s | Enc: %s" % (
+                    entry.get("RSSI") or "?",
+                    entry.get("Auth") or "?",
+                    entry.get("EncrypType") or "?"),
+                Qt.ItemDataRole.ToolTipRole)
+            count += 1
+        if current and combo.findText(current) < 0:
+            combo.addItem(current)
+        combo.setCurrentText(current)
+        combo.blockSignals(False)
+        self._message("Wi-Fi scan: %d network(s)" % count)
+
+    @staticmethod
+    def _select_combo_text(combo, value):
+        text = str(value or "").strip()
+        if not text:
+            return
+        for index in range(combo.count()):
+            if combo.itemText(index).casefold() == text.casefold():
+                combo.setCurrentIndex(index)
+                return
+        combo.addItem(text)
+        combo.setCurrentIndex(combo.count() - 1)
+
+    def _wifi_ssid_activated(self, index):
+        entry = self.network_wifi_ssid_edit.itemData(
+            index, Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, dict):
+            return
+        self._select_combo_text(
+            self.network_wifi_auth_combo, entry.get("Auth"))
+        self._select_combo_text(
+            self.network_wifi_encrypt_combo, entry.get("EncrypType"))
+        self._select_combo_text(
+            self.network_wifi_nettype_combo, entry.get("NetType"))
+        ssid = self.network_wifi_ssid_edit.itemText(index)
+        self._message("Wi-Fi %s: %s / %s" % (
+            ssid, entry.get("Auth") or "?", entry.get("EncrypType") or "?"))
 
     def _set_default_dns(self):
         self.network_dns1_edit.setValue("8.8.8.8")
@@ -6476,19 +8386,47 @@ class MainWindow(QMainWindow):
                         self.wifi_group))
         return widgets
 
+    def _update_upgrade_controls(self, *_):
+        """Keep the local firmware picker (and Upgrade when connected) usable.
+
+        The Upgrade group is checkable, so Qt disables its children whenever
+        the device reports the online-upgrade feature as disabled; the file
+        edit's internal icon button has to be re-enabled explicitly.
+        """
+        self.network_upgrade_file_edit.setEnabled(True)
+        for child in self.network_upgrade_file_edit.findChildren(QWidget):
+            child.setEnabled(True)
+        if self._connected_identity is not None:
+            self.network_upgrade_button.setEnabled(True)
+
     def _enable_device_tabs(self):
         for widget in self._device_tab_widgets():
             widget.setEnabled(True)
         for key, check in self._disable_conn_checks.items():
             check.setEnabled(key in self._network_disable_conn_config)
+        self._update_upgrade_controls()
         self._update_channels_button()
         self._update_encode_table_button()
 
     def _disable_device_tabs(self):
         for widget in self._device_tab_widgets():
+            if widget is self.upgrade_group:
+                continue
             widget.setEnabled(False)
+        for child in self.upgrade_group.findChildren(QWidget):
+            if child is self.network_upgrade_file_edit:
+                continue
+            if self.network_upgrade_file_edit.isAncestorOf(child):
+                continue
+            child.setEnabled(False)
+        self._update_upgrade_controls()
         self.network_default_ip_button.setEnabled(True)
         self.network_default_dns_button.setEnabled(True)
+        self.system_recovery_button.setEnabled(True)
+        self.system_dump_button.setEnabled(True)
+        self.system_open_dir_button.setEnabled(True)
+        self.encode_summary_group.setVisible(False)
+        self._update_cloud_qr("")
 
     def _refresh_age_label(self):
         widget = getattr(self, "system_age_edit", None)
@@ -6514,6 +8452,8 @@ class MainWindow(QMainWindow):
             for widget in panel.findChildren(QWidget):
                 widget.blockSignals(True)
             for widget in panel.findChildren(QLineEdit):
+                if widget is self.network_upgrade_file_edit:
+                    continue
                 widget.clear()
             for widget in panel.findChildren(QComboBox):
                 widget.setCurrentIndex(-1)
@@ -6525,6 +8465,8 @@ class MainWindow(QMainWindow):
                 widget.setRowCount(0)
             for widget in panel.findChildren(QWidget):
                 widget.blockSignals(False)
+        self.encode_summary_group.setVisible(False)
+        self._update_cloud_qr("")
 
     @staticmethod
     def _device_type_name(value):
@@ -6533,6 +8475,45 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             return "" if value is None else str(value)
         return DigitalChannelsDialog.DEVICE_TYPES.get(number, str(number))
+
+    def _update_cloud_qr(self, text=None):
+        label = getattr(self, "system_qr_label", None)
+        if label is None:
+            return
+        cloud = str(text if text is not None
+                    else self.system_cloud_edit.text()).strip()
+        if not cloud or qrcode is None:
+            label.clear()
+            label.setVisible(False)
+            return
+        try:
+            code = qrcode.QRCode(
+                border=2,
+                error_correction=qrcode.constants.ERROR_CORRECT_M)
+            code.add_data(cloud)
+            code.make(fit=True)
+            matrix = code.get_matrix()
+        except Exception:
+            label.clear()
+            label.setVisible(False)
+            return
+        modules = len(matrix)
+        scale = max(2, 190 // modules)
+        size = modules * scale
+        image = QImage(size, size, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.white)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(Qt.GlobalColor.black)
+        for y, row in enumerate(matrix):
+            for x, dark in enumerate(row):
+                if dark:
+                    painter.drawRect(x * scale, y * scale, scale, scale)
+        painter.end()
+        label.setPixmap(QPixmap.fromImage(image))
+        label.setToolTip("Cloud ID: %s" % cloud)
+        label.setVisible(True)
 
     def _fill_broadcast_fields(self, device):
         if not isinstance(device, dict):
@@ -6616,10 +8597,19 @@ class MainWindow(QMainWindow):
             password = self.password_edit.text()
         return username, password
 
-    def _disconnect_device(self):
+    def _device_by_identity(self, identity):
+        if identity is None:
+            return None
+        for device in self.model.devices():
+            if DeviceTableModel.identity(device) == identity:
+                return device
+        return None
+
+    def _drop_connection(self, message=""):
         identity = self._connected_identity
         if identity is None:
             return
+        self._stop_session()
         self.model.set_connected(identity, False)
         self._connected_identity = None
         self._connect_pending = None
@@ -6629,7 +8619,53 @@ class MainWindow(QMainWindow):
         self._pending_fetch_keys = set()
         self.connection_label.setText("Disconnected")
         self._sync_selection_state()
-        self._message("Disconnected")
+        if message:
+            self._message(message)
+
+    def _disconnect_device(self):
+        self._drop_connection("Disconnected")
+
+    def _start_session(self, device):
+        """Keep a real NETIP socket open so a dropped connection is noticed."""
+        self._stop_session()
+        if not isinstance(device, dict):
+            return
+        username, password = self._device_credentials(device)
+        thread = NetipSessionThread(
+            device.get("ip") or "", username, password,
+            cloud_id=device.get("cloud_id") or "",
+            rps=bool(device.get("rps", True)),
+            port=int(device.get("tcp_port") or 34567),
+            no_md5=bool(device.get("no_md5")),
+            parent=self)
+        thread.lost.connect(self._on_session_lost)
+        thread.finished.connect(thread.deleteLater)
+        self._session_thread = thread
+        thread.start()
+
+    def _stop_session(self):
+        thread = self._session_thread
+        self._session_thread = None
+        if thread is not None:
+            thread.stop()
+            if not thread.wait(2000):
+                thread.finished.connect(thread.deleteLater)
+
+    def _on_session_lost(self, text):
+        if self._connected_identity is None:
+            return
+        device = self._device_by_identity(self._connected_identity)
+        label = (device.get("ip") if isinstance(device, dict) else "") \
+            or self._connected_identity
+        if self.video_panel.is_active():
+            self._stop_video()
+        self._drop_connection("Connection lost: %s" % label)
+
+    def _on_video_lost(self, text):
+        if self.video_panel.is_active():
+            self._stop_video()
+        if self._connected_identity is not None:
+            self._drop_connection("Connection lost")
 
     def _connect_device(self, index):
         device = self.model.device_at(index.row())
@@ -6652,6 +8688,7 @@ class MainWindow(QMainWindow):
         self.initial_ip_edit.setValue(device.get("ip") or "")
         self._fill_network_fields(device)
         self._connect_pending = identity
+        self._start_session(device)
         label = "Switching to" if previous is not None and previous != identity else "Connecting to"
         keys = sorted(set(self._tab_fetch_keys(self.tabs.currentIndex()))
                       | {"system", "common"})
@@ -6701,6 +8738,7 @@ class MainWindow(QMainWindow):
         if self._connect_pending is not None:
             self.model.set_connected(self._connect_pending, True)
             self._connect_pending = None
+        self._update_upgrade_controls()
 
     def _on_system_progress(self, text):
         self.fetch_label.setText(text)
@@ -6709,6 +8747,11 @@ class MainWindow(QMainWindow):
         settings = QSettings("xmdm3", "xmdms")
         settings.setValue("theme", str(text).strip().lower())
         apply_theme(QApplication.instance(), text)
+
+    def _passwords_changed(self, text):
+        visible = str(text).strip().lower() != "hide"
+        QSettings("xmdm3", "xmdms").setValue("show_passwords", visible)
+        apply_password_visibility(visible)
 
     def _save_current_tab(self):
         index = self.tabs.currentIndex()
@@ -6783,7 +8826,8 @@ class MainWindow(QMainWindow):
             rps=bool(device.get("rps", True)),
             changes=changes,
             port=device.get("tcp_port") or 34567,
-            parent=self)
+            parent=self,
+            no_md5=bool(device.get("no_md5")))
         thread.fetched.connect(on_fetched or self._on_system_fetched)
         thread.applied.connect(on_applied or self._on_system_applied)
         thread.failed.connect(lambda text, t=thread: self._on_system_failed(text, t))
@@ -6793,6 +8837,7 @@ class MainWindow(QMainWindow):
         thread.finished.connect(lambda t=thread: self._on_system_finished(t))
         self._netip_thread = thread
         self._fetch_in_progress = action == "fetch"
+        self._system_error = False
         self._set_system_busy(True)
         self._message("%s %s ..." % (label or action, device.get("ip") or ""))
         thread.start()
@@ -6835,15 +8880,20 @@ class MainWindow(QMainWindow):
             else:
                 beep &= ~1
             desc["EnableBeep"] = "0x%08X" % (beep & 0xFFFFFFFF)
+            desc["EnableDebugMode"] = self.display_debug_check.isChecked()
             device_desc = desc
-        self._start_system_action(
-            "apply",
-            changes={"values": values, "keys": dict(self._system_general_keys),
-                     "maintain": maintain,
-                     "timezone": timezone,
-                     "device_desc": device_desc,
-                     "preview_num": preview_num},
-            label="Applying")
+        ability = dict(self._network_ability_config)
+        if ability:
+            ability["FaceFunctionEnable"] = self.display_face_check.isChecked()
+            self._network_ability_config = ability
+        changes = {"values": values, "keys": dict(self._system_general_keys),
+                   "maintain": maintain,
+                   "timezone": timezone,
+                   "device_desc": device_desc,
+                   "preview_num": preview_num}
+        if ability:
+            changes["ability"] = ability
+        self._start_system_action("apply", changes=changes, label="Applying")
 
     def _display_apply(self):
         video_out = {}
@@ -6869,9 +8919,15 @@ class MainWindow(QMainWindow):
         ability = dict(self._network_ability_config)
         ability["FaceFunctionEnable"] = self.display_face_check.isChecked()
         self._network_ability_config = ability
+        device_desc = {}
+        if self._system_device_desc_config:
+            desc = dict(self._system_device_desc_config)
+            desc["EnableDebugMode"] = self.display_debug_check.isChecked()
+            device_desc = desc
         self._start_system_action(
             "apply",
-            changes={"video_out": video_out, "gui_set": gui_set, "ability": ability},
+            changes={"video_out": video_out, "gui_set": gui_set,
+                     "ability": ability, "device_desc": device_desc},
             label="Applying display settings on")
 
     @staticmethod
@@ -6935,6 +8991,8 @@ class MainWindow(QMainWindow):
 
             for key in ("codec", "res", "rc"):
                 fields[key].currentTextChanged.connect(refresh)
+            fields["res"].currentTextChanged.connect(
+                self._encode_resolution_changed)
             for key in ("quality", "fps", "gop"):
                 fields[key].valueChanged.connect(refresh)
 
@@ -7076,12 +9134,36 @@ class MainWindow(QMainWindow):
         except ValueError:
             return -1
 
+    @staticmethod
+    def _stream_resolution_mask(entries, stream_types):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("StreamType") or "") in stream_types:
+                return entry.get("ResolutionMask")
+        return None
+
+    def _av_resolution_choices(self, ability):
+        info = ability.get("EncodeInfo")
+        if not isinstance(info, list):
+            info = ability.get("CompEncodeInfo")
+        if not isinstance(info, list):
+            return [], []
+        main_names = self._mask_resolution_names(
+            self._stream_resolution_mask(info, ("MainStream",)))
+        sub_names = self._mask_resolution_names(
+            self._stream_resolution_mask(
+                info, ("ExtraStream", "ExtraStream2", "SubStream")))
+        return main_names, sub_names
+
     def _encode_resolution_choices(self, chn):
         if not (0 <= chn < len(self._encode_ability)):
             return [], []
         ability = self._encode_ability[chn]
         if not isinstance(ability, dict):
             return [], []
+        if self._encode_mode == "av":
+            return self._av_resolution_choices(ability)
         info = ability.get("ability") if isinstance(ability.get("ability"), dict) else ability
         main_names = []
         sizes = info.get("ImageSizePerChannel")
@@ -7116,6 +9198,7 @@ class MainWindow(QMainWindow):
     def _encode_channel_changed(self, *_):
         self._encode_store_current()
         self._encode_load_channel(self.encode_channel_combo.currentData())
+        self._refresh_encode_summary()
 
     def _encode_store_current(self):
         chn = self._encode_current
@@ -7176,6 +9259,13 @@ class MainWindow(QMainWindow):
         av_encode = payload.get("av_encode")
         smart = payload.get("encode_smart")
         self._encode_smart = smart if isinstance(smart, list) else []
+        status = payload.get("chn_status")
+        self._encode_channel_names = []
+        if isinstance(status, list):
+            for item in status:
+                self._encode_channel_names.append(
+                    str(item.get("ChnName") or "").strip()
+                    if isinstance(item, dict) else "")
         if isinstance(configs, list) and configs:
             self._encode_mode = "nvr"
             self._encode_configs = configs
@@ -7207,7 +9297,7 @@ class MainWindow(QMainWindow):
         combo.blockSignals(True)
         combo.clear()
         for chn in range(len(entries)):
-            combo.addItem("Chn %d" % (chn + 1), chn)
+            combo.addItem("CAM%02d" % (chn + 1), chn)
         target = 0
         for chn, entry in enumerate(entries):
             if isinstance(entry, dict):
@@ -7220,6 +9310,7 @@ class MainWindow(QMainWindow):
             self._encode_load_channel(combo.currentData())
         else:
             self._encode_load_channel(None)
+        self._refresh_encode_summary()
         self._update_encode_table_button()
 
     def _encode_smart_changes(self):
@@ -7250,6 +9341,51 @@ class MainWindow(QMainWindow):
         dialog = EncodeTableDialog(self, self)
         dialog.exec()
 
+    def _encode_resolution_changed(self, *_):
+        if self._encode_mode != "nvr" or self._encode_current is None:
+            return
+        self._encode_store_current()
+        self._refresh_encode_summary()
+
+    def _refresh_encode_summary(self):
+        grid = self.encode_summary_grid
+        while grid.count():
+            item = grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        if self._encode_mode != "nvr" or not self._encode_configs:
+            self.encode_summary_group.setVisible(False)
+            return
+        for chn in range(len(self._encode_configs)):
+            entry = self._encode_entry(chn)
+            if isinstance(entry, dict):
+                main = entry.get("MainFormat") if isinstance(
+                    entry.get("MainFormat"), dict) else {}
+                extra = entry.get("ExtraFormat") if isinstance(
+                    entry.get("ExtraFormat"), dict) else {}
+                main_video = main.get("Video") if isinstance(
+                    main.get("Video"), dict) else {}
+                extra_video = extra.get("Video") if isinstance(
+                    extra.get("Video"), dict) else {}
+                main_res = str(main_video.get("Resolution") or "—")
+                sub_res = str(extra_video.get("Resolution") or "—")
+            else:
+                main_res = sub_res = "—"
+            name = (self._encode_channel_names[chn]
+                    if chn < len(self._encode_channel_names) else "")
+            label = QLabel("CAM%02d  %s / %s" % (chn + 1, main_res, sub_res))
+            label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            details = "Channel %d" % (chn + 1)
+            if name:
+                details += ": %s" % name
+            label.setToolTip("%s\nMain: %s\nSub: %s" % (
+                details, main_res, sub_res))
+            grid.addWidget(label, chn // 2, chn % 2)
+        self.encode_summary_group.setVisible(True)
+
     def _encode_apply(self):
         self._encode_store_current()
         if self._encode_mode == "nvr":
@@ -7277,6 +9413,13 @@ class MainWindow(QMainWindow):
     def _camera_param(self, chn):
         if chn is not None and 0 <= chn < len(self._camera_configs):
             config = self._camera_configs[chn]
+            if isinstance(config, dict) and "Ret" not in config:
+                return config
+        return None
+
+    def _camera_ex_param(self, chn):
+        if chn is not None and 0 <= chn < len(self._camera_ex_configs):
+            config = self._camera_ex_configs[chn]
             if isinstance(config, dict) and "Ret" not in config:
                 return config
         return None
@@ -7384,6 +9527,9 @@ class MainWindow(QMainWindow):
         self._load_field_widgets(
             self.camera_widgets, self._camera_param(chn), CAMERA_FIELD_PATHS)
         self._load_field_widgets(
+            self.camera_ex_widgets, self._camera_ex_param(chn),
+            CAMERA_EX_FIELD_PATHS)
+        self._load_field_widgets(
             self.white_light_widgets, self._white_light_param(chn),
             WHITE_LIGHT_FIELD_PATHS)
 
@@ -7396,12 +9542,19 @@ class MainWindow(QMainWindow):
             self.camera_widgets, self._camera_param(self._camera_current),
             CAMERA_FIELD_PATHS)
         self._store_field_widgets(
+            self.camera_ex_widgets, self._camera_ex_param(self._camera_current),
+            CAMERA_EX_FIELD_PATHS)
+        self._store_field_widgets(
             self.white_light_widgets, self._white_light_param(self._camera_current),
             WHITE_LIGHT_FIELD_PATHS)
 
     def _fill_camera_tab(self, payload):
         configs = payload.get("camera_param")
         self._camera_configs = configs if isinstance(configs, list) else []
+        if "camera_ex_param" in payload:
+            ex_configs = payload.get("camera_ex_param")
+            self._camera_ex_configs = (
+                ex_configs if isinstance(ex_configs, list) else [])
         lights = payload.get("white_light")
         self._white_light_configs = lights if isinstance(lights, list) else []
         self._camera_indexed = self._encode_mode == "nvr"
@@ -7409,7 +9562,7 @@ class MainWindow(QMainWindow):
         combo.blockSignals(True)
         combo.clear()
         for chn in range(len(self._camera_configs)):
-            combo.addItem("Chn %d" % (chn + 1), chn)
+            combo.addItem("CAM%02d" % (chn + 1), chn)
         target = 0
         for chn, config in enumerate(self._camera_configs):
             if isinstance(config, dict) and "Ret" not in config:
@@ -7426,10 +9579,18 @@ class MainWindow(QMainWindow):
         for chn, config in enumerate(self._camera_configs):
             if isinstance(config, dict) and "Ret" not in config:
                 channels.append((chn, config))
-        if not channels:
+        ex_channels = []
+        for chn, config in enumerate(self._camera_ex_configs):
+            if isinstance(config, dict) and "Ret" not in config:
+                ex_channels.append((chn, config))
+        if not channels and not ex_channels:
             self._message("No camera settings to apply.")
             return
-        changes = {"camera_param": channels}
+        changes = {}
+        if channels:
+            changes["camera_param"] = channels
+        if ex_channels:
+            changes["camera_ex_param"] = ex_channels
         white = []
         for chn, config in enumerate(self._white_light_configs):
             if isinstance(config, dict) and "Ret" not in config:
@@ -7686,7 +9847,7 @@ class MainWindow(QMainWindow):
         combo.blockSignals(True)
         combo.clear()
         for chn in range(len(self._uart_ptz or [])):
-            combo.addItem("Chn %d" % (chn + 1), chn)
+            combo.addItem("CAM%02d" % (chn + 1), chn)
         combo.setCurrentIndex(0 if self._uart_ptz else -1)
         combo.blockSignals(False)
         self._ptz_current = None
@@ -7940,6 +10101,46 @@ class MainWindow(QMainWindow):
     def _system_sync_time(self):
         self._start_system_action("sync_time", label="Syncing time on")
 
+    @staticmethod
+    def _app_dir():
+        """Folder the app runs from (the PyInstaller onedir folder when frozen)."""
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(os.path.abspath(sys.executable))
+        return HERE
+
+    def add_system_button(self, text, callback, tooltip=""):
+        """Append a local/private action below the System tab buttons."""
+        grid = getattr(self, "system_buttons_grid", None)
+        if grid is None:
+            return None
+        button = QPushButton(text)
+        if tooltip:
+            button.setToolTip(tooltip)
+        button.setMaximumWidth(84)
+        button.clicked.connect(callback)
+        grid.addWidget(button, grid.rowCount(), 0)
+        button.setEnabled(
+            getattr(self, "_connected_identity", None) is not None)
+        return button
+
+    def _open_app_dir(self):
+        path = self._app_dir()
+        if not os.path.isdir(path):
+            path = os.path.expanduser("~")
+        try:
+            if sys.platform.startswith("win") and hasattr(os, "startfile"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(
+                    ["open", path], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(
+                    ["xdg-open", path], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+        except OSError as error:
+            self._message("Cannot open %s: %s" % (path, error))
+
     def _config_dir(self):
         if getattr(sys, "frozen", False):
             base = os.path.dirname(os.path.abspath(sys.executable))
@@ -8074,6 +10275,14 @@ class MainWindow(QMainWindow):
             text = RESULT_CODES.get(ret)
             self._message("Config reset: Ret=%s%s" % (
                 ret, " (%s)" % text if text else ""))
+
+    def _recovery_image(self):
+        dialog = RecoveryDialog(self)
+        dialog.exec()
+
+    def _dump_image(self):
+        dialog = DumpDialog(self)
+        dialog.exec()
 
     def _view_logs(self):
         self._start_system_action("logs", label="Reading logs from",
@@ -8474,13 +10683,16 @@ class MainWindow(QMainWindow):
                 payload.get("ability"), dict) else {}
             self.display_face_check.setChecked(
                 bool(ability.get("FaceFunctionEnable")))
+            self.display_debug_check.setChecked(
+                bool(device_desc.get("EnableDebugMode")))
             audio = device_desc.get("AudioInChannel")
             self.display_audio_edit.setText(
                 "" if audio is None else str(audio))
         if any(key in payload for key in ("encode_channels", "encode_smart",
                                           "encode_ability", "av_encode")):
             self._fill_encode_tab(payload)
-        if "camera_param" in payload or "white_light" in payload:
+        if any(key in payload for key in (
+                "camera_param", "camera_ex_param", "white_light")):
             self._fill_camera_tab(payload)
         if "storage_info" in payload:
             self._fill_storage_tab(payload)
@@ -8509,7 +10721,6 @@ class MainWindow(QMainWindow):
     def _on_system_failed(self, text, thread=None):
         if thread is not None and thread is not self._netip_thread:
             return
-        self._sync_selection_state()
         if self._connect_pending is not None:
             self.model.set_connected(self._connect_pending, False)
             if self._connected_identity == self._connect_pending:
@@ -8517,7 +10728,12 @@ class MainWindow(QMainWindow):
             self._connect_pending = None
             self.connection_label.setText("Disconnected")
         self._fetch_in_progress = False
+        self._system_error = True
         self._message("NetIP error: %s" % text)
+        if self._connected_identity is not None and is_connection_error(text):
+            self._drop_connection()
+        else:
+            self._sync_selection_state()
 
     def _on_system_finished(self, thread=None):
         if thread is None:
@@ -8530,9 +10746,11 @@ class MainWindow(QMainWindow):
             return
         self._netip_thread = None
         if thread is not None:
-            if getattr(thread, "_action", "") == "fetch":
+            if (getattr(thread, "_action", "") == "fetch"
+                    and not self._system_error):
                 self.fetch_label.setText("")
             thread.deleteLater()
+        self._system_error = False
         self._set_system_busy(False)
         self._update_encode_table_button()
         self._fetch_in_progress = False
@@ -8543,6 +10761,13 @@ class MainWindow(QMainWindow):
 
     def _table_context_menu(self, point):
         menu = QMenu(self)
+        index = self.table.indexAt(point)
+        text = table_cell_text(self.table, index)
+        copy_action = menu.addAction("Copy")
+        copy_action.setEnabled(bool(text))
+        copy_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(text))
+        menu.addSeparator()
         menu.addAction("Select all", lambda: self.model.set_all_checked(True))
         menu.addAction("Deselect all", lambda: self.model.set_all_checked(False))
         menu.addSeparator()
@@ -8575,6 +10800,7 @@ class MainWindow(QMainWindow):
         updated = manual_device(
             address, dialog.port(), dialog.username(), dialog.password(),
             cloud_id=cloud_id, rps=dialog.rps())
+        updated["no_md5"] = dialog.no_md5()
         for key in ("sn", "mac", "raw", "http_port", "subnet", "gateway"):
             if device.get(key):
                 updated[key] = device[key]
@@ -8633,7 +10859,7 @@ class MainWindow(QMainWindow):
         self.channel_combo.blockSignals(True)
         self.channel_combo.clear()
         for channel in range(1, count + 1):
-            self.channel_combo.addItem("Chn %d" % channel, channel)
+            self.channel_combo.addItem("CAM%02d" % channel, channel)
         if current is not None:
             index = self.channel_combo.findData(current)
             if index >= 0:
@@ -8644,7 +10870,11 @@ class MainWindow(QMainWindow):
         return int(self.channel_combo.currentData() or 1)
 
     def _stream(self):
-        return int(self.stream_combo.currentData() or 0)
+        return 0 if self.stream_main_radio.isChecked() else 1
+
+    def _stream_radio_changed(self, checked):
+        if checked:
+            self._video_source_changed()
 
     def _add_device(self):
         dialog = AddDeviceDialog(self)
@@ -8660,6 +10890,7 @@ class MainWindow(QMainWindow):
         device = manual_device(
             address, dialog.port(), dialog.username(), dialog.password(),
             cloud_id=cloud_id, rps=dialog.rps())
+        device["no_md5"] = dialog.no_md5()
         self.model.upsert(device)
         if cloud_id:
             self._message("Added cloud device %s:%d" % (cloud_id, device["tcp_port"]))
@@ -8687,11 +10918,17 @@ class MainWindow(QMainWindow):
         if device is None:
             self._message("Select or check a device first.")
             return
+        if not device.get("ip"):
+            self._message("RTSP needs a direct IP address.")
+            return
         username, password = self._device_credentials(device)
         url = build_rtsp_url(
             device, username, password, self._channel(), self._stream())
         QApplication.clipboard().setText(url)
-        self._message("RTSP URL copied: %s" % url)
+        if QDesktopServices.openUrl(QUrl(url)):
+            self._message("RTSP opened (URL also copied): %s" % url)
+        else:
+            self._message("RTSP URL copied (no RTSP app available): %s" % url)
 
     def _toggle_video(self):
         if self.video_panel.is_active():
@@ -8740,10 +10977,33 @@ class MainWindow(QMainWindow):
         if device is None:
             self._message("Select or check a device first.")
             return
-        username, password = self._device_credentials(device)
-        url = build_snapshot_url(device, username, password, self._channel())
-        QDesktopServices.openUrl(QUrl(url))
-        self._message("Opening %s" % url)
+        channel = max(0, self._channel() - 1)
+        self._start_system_action(
+            "snapshot", changes={"channel": channel},
+            label="Taking snapshot on", device=device,
+            on_fetched=self._on_snapshot)
+
+    def _on_snapshot(self, payload):
+        data = payload.get("snapshot") if isinstance(payload, dict) else None
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            self._message("No snapshot returned.")
+            return
+        image = QImage.fromData(bytes(data), "JPG")
+        if image.isNull():
+            self._message("Snapshot is not a valid image.")
+            return
+        device = self._target_device() or {}
+        address = str(device.get("ip") or "device").replace(".", "-")
+        filename = "snap_%s_ch%d_%s.jpg" % (
+            address, self._channel(), time.strftime("%Y%m%d-%H%M%S"))
+        window = SnapshotWindow(
+            image, bytes(data), filename, self)
+        self._snapshot_windows.append(window)
+        window.finished.connect(
+            lambda _=0, w=window: self._snapshot_windows.remove(w)
+            if w in self._snapshot_windows else None)
+        window.show()
+        self._message("Snapshot opened: %dx%d" % (image.width(), image.height()))
 
     NUMBER_ATTEMPTS = 2
 
@@ -8855,6 +11115,99 @@ class MainWindow(QMainWindow):
     def _on_number_finished(self):
         self._ipset_thread = None
         self._start_next_number_job()
+
+    def _change_passwords(self):
+        if self._pass_active or self._pass_thread is not None:
+            self._message("Another operation is running.")
+            return
+        new_password = self.new_password_edit.text()
+        devices = self.model.checked_devices()
+        if not devices:
+            device = self._selected_device()
+            devices = [device] if isinstance(device, dict) else []
+        if not devices:
+            self._message("Check at least one device first.")
+            return
+        if not new_password:
+            answer = QMessageBox.question(
+                self, "Change password",
+                "The new password is empty. Remove the password on %d device(s)?" % len(devices))
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._pause_search()
+        self._pass_queue = list(devices)
+        self._pass_total = len(devices)
+        self._pass_done = 0
+        self._pass_failed = 0
+        self._pass_active = True
+        self.change_button.setEnabled(False)
+        for device in devices:
+            self.model.set_provision_state(
+                DeviceTableModel.identity(device), "active")
+        self._message("Changing password on %d device(s) ..." % self._pass_total)
+        self._start_next_password_job()
+
+    def _start_next_password_job(self):
+        if not self._pass_queue:
+            self._pass_active = False
+            self.change_button.setEnabled(True)
+            self._message("Password change done: %d ok, %d failed." % (
+                self._pass_done, self._pass_failed))
+            self._resume_search()
+            return
+        device = self._pass_queue.pop(0)
+        identity = DeviceTableModel.identity(device)
+        self.model.set_provision_state(identity, "active")
+        username, password = self._device_credentials(device)
+        thread = NetipThread(
+            "user_password",
+            device.get("ip") or "",
+            username,
+            password,
+            cloud_id=device.get("cloud_id") or "",
+            rps=bool(device.get("rps", True)),
+            changes={"values": {
+                "name": username,
+                "old": password,
+                "new": self.new_password_edit.text()}},
+            port=int(device.get("tcp_port") or 34567),
+            parent=self,
+            no_md5=bool(device.get("no_md5")))
+        thread.applied.connect(
+            lambda payload, dev=device: self._on_password_result(dev, payload))
+        thread.failed.connect(
+            lambda text, dev=device: self._on_password_failed(dev, text))
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_password_finished)
+        self._pass_thread = thread
+        thread.start()
+
+    def _on_password_result(self, device, payload):
+        reply = payload.get("user_password") if isinstance(payload, dict) else None
+        ret = reply.get("Ret") if isinstance(reply, dict) else None
+        identity = DeviceTableModel.identity(device)
+        label = device.get("ip") or identity
+        if ret == 100:
+            self._pass_done += 1
+            device["password"] = self.new_password_edit.text()
+            self.model.upsert(device)
+            self.model.set_provision_state(identity, "ok")
+            self._message("Password changed on %s" % label)
+        else:
+            self._pass_failed += 1
+            self.model.set_provision_state(identity, "failed")
+            self._message("Password change on %s failed: Ret=%s" % (label, ret))
+
+    def _on_password_failed(self, device, text):
+        identity = DeviceTableModel.identity(device)
+        self._pass_failed += 1
+        self.model.set_provision_state(identity, "failed")
+        self._message("Password change on %s failed: %s" % (
+            device.get("ip") or identity, text))
+
+    def _on_password_finished(self):
+        self._pass_thread = None
+        self._start_next_password_job()
 
     def _network_config_changes(self):
         changes = {}
@@ -9001,7 +11354,8 @@ class MainWindow(QMainWindow):
             rps=bool(device.get("rps", True)),
             changes=self._network_config_changes(),
             port=device.get("tcp_port") or 34567,
-            parent=self)
+            parent=self,
+            no_md5=bool(device.get("no_md5")))
         thread.applied.connect(self._on_network_config_applied)
         thread.failed.connect(self._on_network_config_failed)
         thread.finished.connect(self._on_network_config_finished)
@@ -9030,6 +11384,7 @@ class MainWindow(QMainWindow):
             self._resume_search()
             return
         device, address, submask, gateway = pending
+        self._ipset_target = (device, address)
         interface = self.interface_combo.currentData()
         if not isinstance(interface, dict):
             interface = {"ip": "", "broadcast": "255.255.255.255"}
@@ -9061,6 +11416,21 @@ class MainWindow(QMainWindow):
         ret = message.get("Ret")
         text = RESULT_CODES.get(ret, "Unknown result")
         self._message("Device replied: Ret=%s (%s)" % (ret, text))
+        target = self._ipset_target
+        self._ipset_target = None
+        if ret != 100 or target is None:
+            return
+        device, address = target
+        old_address = str(device.get("ip") or "")
+        if not address or address == old_address:
+            return
+        identity = DeviceTableModel.identity(device)
+        if identity == self._connected_identity:
+            if self.video_panel.is_active():
+                self._stop_video()
+            self._drop_connection(
+                "IP changed to %s — reconnect to the new address" % address)
+        self.model.set_device_ip(device, address)
 
     def _on_network_failed(self, text):
         self._message("Failed: %s" % text)
@@ -9079,12 +11449,13 @@ class MainWindow(QMainWindow):
             self.search_button.setChecked(False)
 
     def closeEvent(self, event):
+        self._stop_session()
         channels_dialog = self._channels_dialog
         self._channels_dialog = None
         if channels_dialog is not None:
             channels_dialog.close()
             channels_dialog.deleteLater()
-        self.video_panel.stop()
+        self.video_panel.stop(wait=True)
         thread = self._thread
         self._thread = None
         if thread is not None:
@@ -9094,6 +11465,10 @@ class MainWindow(QMainWindow):
         self._ipset_thread = None
         if ipset_thread is not None:
             ipset_thread.wait(4000)
+        pass_thread = self._pass_thread
+        self._pass_thread = None
+        if pass_thread is not None:
+            pass_thread.wait(10000)
         probe_thread = self._probe_thread
         self._probe_thread = None
         if probe_thread is not None:
@@ -9112,6 +11487,27 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def fit_window_to_screen(window):
+    """Keep the title bar reachable when the layout minimum exceeds the screen."""
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is None:
+        return
+    available = screen.availableGeometry()
+    frame = window.frameGeometry()
+    width = max(1, frame.width())
+    height = max(1, frame.height())
+    x = frame.x()
+    y = frame.y()
+    if x < available.left() or x + width > available.right() + 1:
+        x = available.left() + max(0, (available.width() - width) // 2)
+    if y < available.top() or y + height > available.bottom() + 1:
+        y = available.top() + max(0, (available.height() - height) // 2)
+    x = max(available.left(), x)
+    y = max(available.top(), y)
+    if (x, y) != (frame.x(), frame.y()):
+        window.move(x, y)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("XMDMS")
@@ -9123,7 +11519,10 @@ def main():
     icon = app_icon()
     window.setWindowIcon(icon)
     app.setWindowIcon(icon)
+    fit_window_to_screen(window)
     window.show()
+    fit_window_to_screen(window)
+    QTimer.singleShot(0, lambda: fit_window_to_screen(window))
     window.setWindowIcon(icon)
     return app.exec()
 

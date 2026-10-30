@@ -1,3 +1,13 @@
+# Runtime dependencies (pip install -r requirements.txt)
 PySide6==6.9.*
 psutil>=5.9
 cryptography>=42
+qrcode>=7.4
+
+# Vendored, not on PyPI: dvrip.py must sit next to xmdms.py.
+#
+# Optional:
+#   av>=10          PyAV video-decoder fallback
+#   colorama>=0.4   required by xmcloud.py (cloud/RPS transport, not distributed)
+#
+# Build (Windows): pip install pyinstaller>=6.11   (see build_windows.bat)
