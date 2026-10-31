@@ -19,6 +19,11 @@ RU = {
     "Export": "Экспорт",
     "SNAP": "Снимок",
     "START VIDEO": "ВИДЕО",
+    "Focus": "Фокус",
+    "Show focus sharpness scores for four regions. Point the camera at a detailed scene.":
+        "Показать оценку резкости по четырём зонам. Наведите камеру на детализированную сцену.",
+    "Analyzing focus...": "Анализ фокуса...",
+    "Low detail — use a target": "Мало деталей — используйте мишень",
     "Channel:": "Канал:",
     "Stream:": "Поток:",
     "Main": "Основной",

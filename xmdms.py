@@ -6,6 +6,7 @@ import importlib.util
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -48,6 +49,7 @@ from PySide6.QtGui import (
     QIntValidator,
     QPainter,
     QPalette,
+    QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -59,6 +61,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGraphicsScene,
+    QGraphicsView,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -170,14 +174,14 @@ try:
         QMediaDevices,
         QMediaPlayer,
     )
-    from PySide6.QtMultimediaWidgets import QVideoWidget
+    from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
     QT_MULTIMEDIA = True
 except Exception:
     QAudioFormat = None
     QAudioSink = None
     QMediaDevices = None
     QMediaPlayer = None
-    QVideoWidget = None
+    QGraphicsVideoItem = None
     QT_MULTIMEDIA = False
 
 try:
@@ -6185,6 +6189,238 @@ class StreamRecorder(QObject):
         return None
 
 
+FOCUS_WIDTH = 320
+FOCUS_HEIGHT = 180
+FOCUS_INTERVAL = 0.35
+FOCUS_MIN_DETAIL = 6.0
+FOCUS_LOG_DIVISOR = 5.0
+
+
+def analyze_focus(image):
+    """Return four quadrant sharpness scores (0-100) and an overall score.
+
+    The score is based on the variance of the Laplacian on a downscaled
+    grayscale image.  Low-detail regions return ``None`` instead of a
+    misleading score: a blank wall has no focus signal to measure.
+    """
+    empty = [None, None, None, None]
+    if not isinstance(image, QImage) or image.isNull():
+        return empty, None, False
+    small = image.scaled(
+        FOCUS_WIDTH, FOCUS_HEIGHT,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation)
+    gray = small.convertToFormat(QImage.Format.Format_Grayscale8)
+    if gray.isNull():
+        return empty, None, False
+    width, height = gray.width(), gray.height()
+    stride = gray.bytesPerLine()
+    data = memoryview(gray.bits())
+    scores = []
+    for top, bottom in ((0, height // 2), (height // 2, height)):
+        for left, right in ((0, width // 2), (width // 2, width)):
+            lap_sum = 0
+            lap_sq = 0
+            gray_sum = 0
+            gray_sq = 0
+            count = 0
+            for y in range(max(1, top + 1), min(height - 1, bottom - 1)):
+                row = y * stride
+                for x in range(max(1, left + 1), min(width - 1, right - 1)):
+                    index = row + x
+                    value = data[index]
+                    lap = (4 * value - data[index - 1] - data[index + 1]
+                           - data[index - stride] - data[index + stride])
+                    lap_sum += lap
+                    lap_sq += lap * lap
+                    gray_sum += value
+                    gray_sq += value * value
+                    count += 1
+            if count == 0:
+                scores.append(None)
+                continue
+            mean_lap = lap_sum / count
+            variance = max(0.0, lap_sq / count - mean_lap * mean_lap)
+            mean_gray = gray_sum / count
+            gray_variance = max(
+                0.0, gray_sq / count - mean_gray * mean_gray)
+            if math.sqrt(gray_variance) < FOCUS_MIN_DETAIL:
+                scores.append(None)
+                continue
+            score = round(
+                100.0 * math.log10(1.0 + variance) / FOCUS_LOG_DIVISOR)
+            scores.append(max(0, min(100, int(score))))
+    valid = [score for score in scores if score is not None]
+    overall = round(sum(valid) / len(valid)) if valid else None
+    return scores, overall, not valid
+
+
+class FocusOverlay(QWidget):
+    """Transparent four-zone sharpness overlay drawn over the video."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scores = [None, None, None, None]
+        self._overall = None
+        self._low_detail = False
+        self._frame_size = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.hide()
+
+    def set_frame_size(self, size):
+        self._frame_size = tuple(size) if size else None
+        self.update()
+
+    def set_scores(self, scores, overall, low_detail=False):
+        values = list(scores or [])
+        values = (values + [None, None, None, None])[:4]
+        self._scores = values
+        self._overall = overall
+        self._low_detail = bool(low_detail)
+        self.update()
+
+    def clear(self):
+        self._scores = [None, None, None, None]
+        self._overall = None
+        self._low_detail = False
+        self.update()
+
+    def _content_rect(self):
+        rect = self.rect()
+        if not self._frame_size:
+            return rect
+        frame_width, frame_height = self._frame_size
+        if frame_width <= 0 or frame_height <= 0:
+            return rect
+        scale = min(
+            rect.width() / float(frame_width),
+            rect.height() / float(frame_height))
+        width = max(1, int(frame_width * scale))
+        height = max(1, int(frame_height * scale))
+        return QRect(
+            rect.left() + (rect.width() - width) // 2,
+            rect.top() + (rect.height() - height) // 2,
+            width, height)
+
+    @staticmethod
+    def _score_color(score):
+        if score is None:
+            return QColor(210, 210, 210, 190)
+        if score >= 70:
+            return QColor(76, 175, 80, 235)
+        if score >= 45:
+            return QColor(255, 193, 7, 235)
+        return QColor(244, 67, 54, 235)
+
+    def paintEvent(self, _event):
+        rect = self._content_rect().adjusted(4, 4, -4, -4)
+        if rect.width() < 80 or rect.height() < 60:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        banner_font = self.font()
+        banner_font.setBold(True)
+        banner_font.setPixelSize(max(11, min(18, rect.height() // 24)))
+        painter.setFont(banner_font)
+        metrics = painter.fontMetrics()
+        if self._low_detail:
+            text = tr("Low detail — use a target")
+        elif self._overall is None:
+            text = tr("Analyzing focus...")
+        else:
+            text = "%s %d" % (tr("Focus"), self._overall)
+        text = metrics.elidedText(
+            text, Qt.TextElideMode.ElideRight, max(60, rect.width() - 32))
+        banner_width = min(
+            rect.width() - 8, metrics.horizontalAdvance(text) + 24)
+        banner_height = metrics.height() + 10
+        banner = QRect(
+            rect.left() + (rect.width() - banner_width) // 2,
+            rect.top(), banner_width, banner_height)
+        painter.setPen(QPen(QColor(255, 255, 255, 150), 1))
+        painter.setBrush(QColor(0, 0, 0, 155))
+        painter.drawRoundedRect(banner, 6, 6)
+        painter.setPen(QColor(255, 255, 255, 235))
+        painter.drawText(
+            banner, Qt.AlignmentFlag.AlignCenter, text)
+
+        gap = max(4, rect.height() // 60)
+        left = rect.left()
+        top = rect.top() + banner_height + gap
+        width = rect.width()
+        height = max(1, rect.bottom() - top + 1)
+        cell_width = max(1, (width - gap) // 2)
+        cell_height = max(1, (height - gap) // 2)
+        cells = (
+            QRect(left, top, cell_width, cell_height),
+            QRect(left + cell_width + gap, top, cell_width, cell_height),
+            QRect(left, top + cell_height + gap, cell_width, cell_height),
+            QRect(left + cell_width + gap, top + cell_height + gap,
+                  cell_width, cell_height),
+        )
+
+        score_font = self.font()
+        score_font.setBold(True)
+        score_font.setPixelSize(
+            max(18, min(48, int(cell_height * 0.30))))
+        painter.setFont(score_font)
+        for cell, score in zip(cells, self._scores):
+            color = self._score_color(score)
+            painter.setPen(QPen(QColor(color.red(), color.green(),
+                                      color.blue(), 190), 2))
+            painter.setBrush(QColor(0, 0, 0, 38))
+            painter.drawRect(cell)
+            label = "--" if score is None else str(score)
+            shadow = cell.adjusted(1, 1, 1, 1)
+            painter.setPen(QColor(0, 0, 0, 190))
+            painter.drawText(
+                shadow, Qt.AlignmentFlag.AlignCenter, label)
+            painter.setPen(color)
+            painter.drawText(
+                cell, Qt.AlignmentFlag.AlignCenter, label)
+        painter.end()
+
+
+class VideoView(QGraphicsView):
+    """QGraphicsView-based video surface that supports widget overlays."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setBackgroundBrush(QColor(16, 16, 16))
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setScene(QGraphicsScene(self))
+        self.video_item = QGraphicsVideoItem()
+        self.video_item.setAspectRatioMode(
+            Qt.AspectRatioMode.KeepAspectRatio)
+        self.scene().addItem(self.video_item)
+        self.video_item.nativeSizeChanged.connect(self._fit_video)
+
+    def _fit_video(self, *_args):
+        size = self.video_item.nativeSize()
+        if size.isEmpty():
+            return
+        if self.video_item.size() != size:
+            self.video_item.setSize(size)
+        rect = self.video_item.boundingRect()
+        if rect.isEmpty():
+            return
+        self.setSceneRect(rect)
+        self.fitInView(
+            self.video_item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_video()
+
+
 class VideoPanel(QWidget):
     status_changed = Signal(str)
     keyframe = Signal()
@@ -6200,6 +6436,7 @@ class VideoPanel(QWidget):
         self._image = None
         self._frame_size = None
         self._last_frame_time = 0.0
+        self._focus_last = 0.0
         self._stream = "Main"
         self._channel = 0
         self._device = None
@@ -6234,12 +6471,12 @@ class VideoPanel(QWidget):
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setMinimumSize(320, 180)
         self.video_label.setStyleSheet("background-color: #101010; color: #808080;")
-        self.video_widget = QVideoWidget() if QT_MULTIMEDIA else None
+        self.video_view = VideoView() if QT_MULTIMEDIA else None
         self._stack = QStackedWidget()
         self._stack.addWidget(self.video_label)
-        if self.video_widget is not None:
-            self.video_widget.setMinimumSize(320, 180)
-            self._stack.addWidget(self.video_widget)
+        if self.video_view is not None:
+            self.video_view.setMinimumSize(320, 180)
+            self._stack.addWidget(self.video_view)
 
         self.mute_check = QCheckBox("Mute")
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
@@ -6259,6 +6496,14 @@ class VideoPanel(QWidget):
             "color: #C62828; font-weight: bold;")
         self._recorder = StreamRecorder(self)
 
+        self.focus_button = QPushButton("Focus")
+        self.focus_button.setCheckable(True)
+        self.focus_button.setEnabled(False)
+        self.focus_button.setToolTip(
+            "Show focus sharpness scores for four regions. "
+            "Point the camera at a detailed scene.")
+        self.focus_button.toggled.connect(self._toggle_focus)
+
         controls = QHBoxLayout()
         controls.setContentsMargins(2, 0, 2, 0)
         controls.addWidget(self.mute_check)
@@ -6266,17 +6511,20 @@ class VideoPanel(QWidget):
         controls.addSpacing(8)
         controls.addWidget(self.record_button)
         controls.addWidget(self.record_label)
+        controls.addWidget(self.focus_button)
         controls.addStretch(1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._stack, 1)
         layout.addLayout(controls)
+        self.focus_overlay = FocusOverlay(self)
+        self.focus_overlay.hide()
 
         self._stream_device = None
         self._player = QMediaPlayer(self) if QT_MULTIMEDIA else None
-        if self._player is not None and self.video_widget is not None:
-            self._player.setVideoOutput(self.video_widget)
+        if self._player is not None and self.video_view is not None:
+            self._player.setVideoOutput(self.video_view.video_item)
             self._player.errorOccurred.connect(self._on_qt_error)
             self._player.mediaStatusChanged.connect(self._on_qt_media_status)
             sink = self._player.videoSink()
@@ -6454,12 +6702,19 @@ class VideoPanel(QWidget):
                   "jpeg": "mjpeg"}.get(self._qt_codec or "", "bin")
         self._player.setSourceDevice(device, QUrl("stream." + suffix))
         self._player.play()
-        if self.video_widget is not None:
-            self._stack.setCurrentWidget(self.video_widget)
+        if self.video_view is not None:
+            self._stack.setCurrentWidget(self.video_view)
 
     def _on_video_frame(self, frame):
         if frame.isValid():
             self._frame_size = (frame.width(), frame.height())
+            if self.focus_button.isChecked() and self._active:
+                now = time.monotonic()
+                if now - self._focus_last >= FOCUS_INTERVAL:
+                    self._focus_last = now
+                    image = frame.toImage()
+                    if not image.isNull():
+                        self._focus_analyze(image)
 
     def _on_qt_error(self, error, text):
         if not self._active:
@@ -6491,6 +6746,7 @@ class VideoPanel(QWidget):
         if self._stack.currentWidget() is not self.video_label:
             self._stack.setCurrentWidget(self.video_label)
         self._update_pixmap()
+        self._focus_maybe_update(image)
 
     def _on_image(self, image):
         if isinstance(image, QImage) and not image.isNull():
@@ -6503,6 +6759,54 @@ class VideoPanel(QWidget):
 
     def _set_status(self, text):
         self.status_changed.emit(text)
+
+    def _toggle_focus(self, checked):
+        if checked and not self._active:
+            self.focus_button.blockSignals(True)
+            self.focus_button.setChecked(False)
+            self.focus_button.blockSignals(False)
+            return
+        if not checked:
+            self.focus_overlay.hide()
+            return
+        self._focus_last = 0.0
+        self.focus_overlay.set_frame_size(self._frame_size)
+        self.focus_overlay.clear()
+        self._position_focus_overlay()
+        self.focus_overlay.show()
+        self.focus_overlay.raise_()
+        if self._image is not None:
+            self._focus_analyze(self._image)
+
+    def _focus_analyze(self, image):
+        scores, overall, low_detail = analyze_focus(image)
+        self.focus_overlay.set_frame_size((image.width(), image.height()))
+        self.focus_overlay.set_scores(scores, overall, low_detail)
+        self._position_focus_overlay()
+
+    def _focus_maybe_update(self, image):
+        if not self.focus_button.isChecked() or not self._active:
+            return
+        now = time.monotonic()
+        if now - self._focus_last < FOCUS_INTERVAL:
+            return
+        self._focus_last = now
+        self._focus_analyze(image)
+
+    def _position_focus_overlay(self):
+        if not hasattr(self, "focus_overlay"):
+            return
+        self.focus_overlay.setGeometry(self._stack.geometry())
+        if self.focus_button.isChecked():
+            self.focus_overlay.raise_()
+
+    def _reset_focus(self):
+        self.focus_button.blockSignals(True)
+        self.focus_button.setChecked(False)
+        self.focus_button.blockSignals(False)
+        self.focus_button.setEnabled(False)
+        self.focus_overlay.hide()
+        self.focus_overlay.clear()
 
     def is_active(self):
         return self._thread is not None
@@ -6558,6 +6862,7 @@ class VideoPanel(QWidget):
         self._active = True
         self._watchdog.start(6000)
         thread.start()
+        self.focus_button.setEnabled(True)
         return True
 
     def _on_keyframe(self):
@@ -6576,6 +6881,9 @@ class VideoPanel(QWidget):
         self._channel = int(channel)
         self._switch_target = (stream, int(channel))
         self._switch_mark = self._decoded
+        self._focus_last = 0.0
+        if self.focus_button.isChecked():
+            self.focus_overlay.clear()
         self._switch_deadline = time.monotonic() + 2.0
         self._thread.switch(stream, channel)
         self._switch_timer.start()
@@ -6595,6 +6903,7 @@ class VideoPanel(QWidget):
 
     def stop(self, wait=False):
         self._active = False
+        self._reset_focus()
         self._watchdog.stop()
         self._switch_timer.stop()
         self._switch_target = None
@@ -6662,7 +6971,12 @@ class VideoPanel(QWidget):
 
     def resizeEvent(self, event):
         self._update_pixmap()
+        self._position_focus_overlay()
         super().resizeEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._position_focus_overlay)
 
     def _on_stats(self, text):
         if self._frame_size is not None:
