@@ -8819,8 +8819,8 @@ class MainWindow(QMainWindow):
             ssid, entry.get("Auth") or "?", entry.get("EncrypType") or "?"))
 
     def _set_default_dns(self):
-        self.network_dns1_edit.setValue("8.8.8.8")
-        self.network_dns2_edit.setValue("8.8.4.4")
+        self.network_dns1_edit.setValue("77.88.8.8")
+        self.network_dns2_edit.setValue("1.1.1.1")
 
     def _fill_network_fields(self, device):
         if not isinstance(device, dict):
