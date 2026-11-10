@@ -27,6 +27,7 @@ from urllib.parse import quote
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QDate,
     QEvent,
     QIODevice,
     QModelIndex,
@@ -59,6 +60,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -77,7 +79,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -1628,6 +1629,44 @@ class IpSetThread(QThread):
             sock.close()
 
 
+def query_device_logs(camera, begin, end):
+    """Read every page of device logs for the given time range.
+
+    NETIP returns at most 128 records per OPLogQuery response.  Continue
+    from the Position after the final record of each page until the device
+    returns no more entries.
+    """
+    entries = []
+    position = 0
+    for _ in range(1000):
+        reply = camera.send(1442, {
+            "Name": "OPLogQuery",
+            "OPLogQuery": {
+                "BeginTime": str(begin),
+                "EndTime": str(end),
+                "LogPosition": position,
+                "Type": "LogAll",
+            },
+        })
+        if not isinstance(reply, dict):
+            break
+        page = reply.get("OPLogQuery")
+        if not isinstance(page, list) or not page:
+            break
+        page_entries = [item for item in page if isinstance(item, dict)]
+        if not page_entries:
+            break
+        entries.extend(page_entries)
+        try:
+            next_position = int(page_entries[-1].get("Position")) + 1
+        except (TypeError, ValueError):
+            break
+        if next_position <= position:
+            break
+        position = next_position
+    return entries
+
+
 class NetipThread(QThread):
     fetched = Signal(dict)
     applied = Signal(dict)
@@ -1968,17 +2007,15 @@ class NetipThread(QThread):
                 })
                 return
             if action == "logs":
-                end = datetime.now()
-                begin = end - timedelta(days=30)
-                self.fetched.emit({"logs": camera.send(1442, {
-                    "Name": "OPLogQuery",
-                    "OPLogQuery": {
-                        "BeginTime": begin.strftime("%Y-%m-%d %H:%M:%S"),
-                        "EndTime": end.strftime("%Y-%m-%d %H:%M:%S"),
-                        "LogPosition": 0,
-                        "Type": "LogAll",
-                    },
-                })})
+                end = self._changes.get("end")
+                begin = self._changes.get("begin")
+                if not end:
+                    end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if not begin:
+                    begin = (datetime.now() - timedelta(days=3)).strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                logs = query_device_logs(camera, begin, end)
+                self.fetched.emit({"logs": {"OPLogQuery": logs}})
                 return
             if action == "erase_logs":
                 self.applied.emit({"EraseLogs": camera.send(1450, {
@@ -4327,11 +4364,12 @@ class DumpDialog(QDialog):
     COLUMNS = ("", "#", "Name", "Load", "Entry", "Size")
     COL_CHECK = 0
     COL_NAME = 2
+    CRYPTO_DEFAULT_OFFSET = 0x2FC00
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Firmware dump")
-        self.resize(700, 470)
+        self.setWindowTitle("Firmware to dump convertor")
+        self.resize(700, 500)
         self._zip_path = ""
         self._entries = {}
 
@@ -4343,6 +4381,22 @@ class DumpDialog(QDialog):
         input_row.addWidget(QLabel("Firmware file:"))
         input_row.addWidget(self.input_edit, 1)
         input_row.addWidget(input_button)
+
+        self.crypto_edit = QLineEdit()
+        self.crypto_edit.setReadOnly(True)
+        crypto_button = QPushButton("Browse...")
+        crypto_button.clicked.connect(self._pick_crypto)
+        self.crypto_offset_edit = QLineEdit("0x%X" % self.CRYPTO_DEFAULT_OFFSET)
+        self.crypto_offset_edit.setFixedWidth(110)
+        self.crypto_offset_edit.setToolTip(
+            "Flash offset where the crypto file is inserted (hex or decimal).")
+        crypto_row = QHBoxLayout()
+        crypto_row.addWidget(QLabel("Crypto file:"))
+        crypto_row.addWidget(self.crypto_edit, 1)
+        crypto_row.addWidget(crypto_button)
+        crypto_row.addSpacing(8)
+        crypto_row.addWidget(QLabel("Offset:"))
+        crypto_row.addWidget(self.crypto_offset_edit)
 
         self.size_spin = QSpinBox()
         self.size_spin.setRange(8, 4096)
@@ -4405,15 +4459,20 @@ class DumpDialog(QDialog):
         self.summary_label = QLabel("Pick a firmware file to begin.")
         self.build_button = QPushButton("Build")
         self.build_button.clicked.connect(self._build)
+        self.open_dir_button = QPushButton("Open dir")
+        self.open_dir_button.setEnabled(False)
+        self.open_dir_button.clicked.connect(self._open_output_dir)
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.reject)
         buttons = QHBoxLayout()
         buttons.addWidget(self.summary_label, 1)
         buttons.addWidget(self.build_button)
+        buttons.addWidget(self.open_dir_button)
         buttons.addWidget(close_button)
 
         layout = QVBoxLayout(self)
         layout.addLayout(input_row)
+        layout.addLayout(crypto_row)
         layout.addLayout(size_row)
         layout.addLayout(list_bar)
         layout.addWidget(self.file_table, 1)
@@ -4453,7 +4512,83 @@ class DumpDialog(QDialog):
         self.input_edit.setText(path)
         settings.setValue("firmware_dir", os.path.dirname(path))
         self.output_edit.setText(os.path.splitext(path)[0] + ".dump")
+        self.open_dir_button.setEnabled(True)
         self._load_entries()
+
+    def _pick_crypto(self):
+        settings = QSettings("xmdm3", "xmdms")
+        current = self.crypto_edit.text().strip()
+        start_dir = os.path.dirname(current) or os.path.dirname(
+            self._zip_path) or str(
+                settings.value("firmware_dir", "", type=str) or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select crypto file", start_dir, "All files (*)")
+        if not path:
+            return
+        self.crypto_edit.setText(path)
+        self._update_crypto_offset()
+        self._update_summary()
+
+    @staticmethod
+    def _is_uboot_env(name, header=None):
+        candidates = [str(name or "")]
+        if isinstance(header, dict):
+            candidates.append(str(header.get("name") or ""))
+        for value in candidates:
+            text = os.path.splitext(os.path.basename(value))[0].lower()
+            text = text.replace("_", "-").replace(" ", "-")
+            if text in ("env", "environment"):
+                return True
+            if not ("env" in text or "environment" in text):
+                continue
+            if ("uboot" in text or "u-boot" in text or "boot" in text
+                    or text.startswith("env-")):
+                return True
+        return False
+
+    def _uboot_env_offset(self):
+        for name, header in self._entries.items():
+            if not self._is_uboot_env(name, header):
+                continue
+            try:
+                load = int(header.get("load"))
+            except (TypeError, ValueError):
+                continue
+            if load >= 1024:
+                return load - 1024
+        return None
+
+    def _update_crypto_offset(self):
+        offset = self._uboot_env_offset()
+        if offset is None:
+            offset = self.CRYPTO_DEFAULT_OFFSET
+        self.crypto_offset_edit.setText("0x%X" % offset)
+
+    def _crypto_offset(self):
+        text = self.crypto_offset_edit.text().strip()
+        if not text:
+            raise ValueError("empty offset")
+        if text.lower().startswith("0x"):
+            return int(text, 16)
+        try:
+            return int(text, 10)
+        except ValueError:
+            return int(text, 16)
+
+    def _crypto_end(self):
+        if not hasattr(self, "crypto_edit"):
+            return 0
+        path = self.crypto_edit.text().strip()
+        if not path or not os.path.isfile(path):
+            return 0
+        try:
+            offset = self._crypto_offset()
+            size = os.path.getsize(path)
+        except (OSError, TypeError, ValueError):
+            return 0
+        if offset < 0:
+            return 0
+        return offset + size
 
     def _load_entries(self):
         table = self.file_table
@@ -4495,6 +4630,8 @@ class DumpDialog(QDialog):
         except (OSError, zipfile.BadZipFile) as exc:
             error = exc
         table.blockSignals(False)
+        self._update_crypto_offset()
+        self._reset_size()
         self._update_summary()
         if error is not None:
             self._notify("Cannot read the firmware file: %s" % error)
@@ -4526,21 +4663,27 @@ class DumpDialog(QDialog):
             if not header:
                 continue
             required = max(required, header["load"] + header["size"])
+        required = max(required, self._crypto_end())
         if not required:
             return 0
         return max(8, (required + (1 << 20) - 1) >> 20)
 
+    @staticmethod
+    def _recommended_size(required_mb):
+        for step in DUMP_SIZE_STEPS:
+            if step >= required_mb:
+                return step
+        return min(4096, ((required_mb + 1023) // 1024) * 1024)
+
+    def _reset_size(self):
+        self.size_spin.setValue(
+            self._recommended_size(self._required_mb()))
+
     def _bump_size(self, required_mb):
         if required_mb <= self.size_spin.value():
             return
-        target = None
-        for step in DUMP_SIZE_STEPS:
-            if step >= required_mb:
-                target = step
-                break
-        if target is None:
-            target = min(4096, ((required_mb + 1023) // 1024) * 1024)
-        self.size_spin.setValue(target)
+        self.size_spin.setValue(
+            self._recommended_size(required_mb))
 
     def _update_summary(self, *_):
         total = self.file_table.rowCount()
@@ -4602,16 +4745,56 @@ class DumpDialog(QDialog):
         if not written:
             self._notify("Dump failed: nothing to write")
             return
+        crypto_path = self.crypto_edit.text().strip()
+        crypto_written = False
+        if crypto_path:
+            try:
+                with open(crypto_path, "rb") as handle:
+                    crypto = handle.read()
+            except OSError:
+                self._notify("Dump failed: cannot read the crypto file")
+                return
+            try:
+                crypto_offset = self._crypto_offset()
+            except (TypeError, ValueError):
+                self._notify("Dump failed: invalid crypto offset")
+                return
+            if (crypto_offset < 0
+                    or crypto_offset + len(crypto) > len(dump)):
+                self._notify("Dump failed: crypto file does not fit")
+                return
+            dump[crypto_offset:crypto_offset + len(crypto)] = crypto
+            crypto_written = bool(crypto)
         try:
             with open(output, "wb") as handle:
                 handle.write(dump)
         except OSError:
             self._notify("Dump failed: cannot write the output file")
             return
+        self.open_dir_button.setEnabled(True)
+        details = []
         if skipped:
-            self._notify("Dump written successfully (%d skipped)" % len(skipped))
+            details.append("%d skipped" % len(skipped))
+        if crypto_written:
+            details.append("crypto included")
+        if details:
+            self._notify(
+                "Dump written successfully (%s)" % ", ".join(details))
         else:
             self._notify("Dump written successfully")
+
+    def _open_output_dir(self):
+        output = self.output_edit.text().strip()
+        source = output or self._zip_path
+        if not source:
+            self._notify("Output folder is not available.")
+            return
+        path = os.path.dirname(os.path.abspath(source))
+        if not os.path.isdir(path):
+            self._notify("Output folder is not available.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self._notify("Cannot open output folder.")
 
 
 class ResetConfigDialog(QDialog):
@@ -7738,6 +7921,113 @@ def db_load_devices(connection, config):
     return devices, hidden_count
 
 
+class DeviceLogsDialog(QDialog):
+    """Device log viewer with a selectable start/end date range."""
+
+    refresh_requested = Signal(str, str)
+
+    def __init__(self, device_name="", parent=None):
+        super().__init__(parent)
+        title = tr("Device logs")
+        if device_name:
+            title = "%s — %s" % (title, device_name)
+        self.setWindowTitle(title)
+        self.resize(900, 600)
+
+        self.start_date = QDateEdit()
+        self.start_date.setCalendarPopup(True)
+        self.start_date.setDisplayFormat("yyyy-MM-dd")
+        self.start_date.setDate(QDate.currentDate().addDays(-3))
+        self.end_date = QDateEdit()
+        self.end_date.setCalendarPopup(True)
+        self.end_date.setDisplayFormat("yyyy-MM-dd")
+        self.end_date.setDate(QDate.currentDate())
+
+        self.refresh_button = QPushButton(tr("Refresh"))
+        self.refresh_button.clicked.connect(self.refresh)
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setProperty("i18nDynamic", True)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            [tr("Time"), tr("User"), tr("Event"), tr("Text")])
+        self.table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setHighlightSections(False)
+        header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch)
+
+        date_row = QHBoxLayout()
+        date_row.addWidget(QLabel(tr("From:")))
+        date_row.addWidget(self.start_date)
+        date_row.addSpacing(8)
+        date_row.addWidget(QLabel(tr("To:")))
+        date_row.addWidget(self.end_date)
+        date_row.addSpacing(8)
+        date_row.addWidget(self.refresh_button)
+        date_row.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(date_row)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(self.status_label)
+
+    def refresh(self):
+        start = self.start_date.date()
+        end = self.end_date.date()
+        if start > end:
+            self.status_label.setText(
+                tr("Start date is after end date."))
+            return
+        self.refresh_button.setEnabled(False)
+        self.status_label.setText(tr("Loading..."))
+        self.refresh_requested.emit(
+            start.toString("yyyy-MM-dd") + " 00:00:00",
+            end.toString("yyyy-MM-dd") + " 23:59:59")
+
+    def set_logs(self, logs):
+        self.table.clearContents()
+        self.table.setRowCount(0)
+        rows = []
+        for log in logs:
+            if not isinstance(log, dict):
+                continue
+            rows.append((
+                str(log.get("Time") or ""),
+                str(log.get("User") or ""),
+                str(log.get("Type") or ""),
+                str(log.get("Data") or ""),
+            ))
+        self.table.setRowCount(len(rows))
+        for row, values in enumerate(rows):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.table.setItem(row, column, item)
+        self.status_label.setText(
+            "%d %s" % (len(rows), tr("entries")))
+        self.refresh_button.setEnabled(True)
+
+    def set_error(self, text):
+        self.status_label.setText(str(text))
+        self.refresh_button.setEnabled(True)
+
+
 class DatabaseDialog(QDialog):
     def __init__(self, config=None, password="", parent=None):
         super().__init__(parent)
@@ -8548,6 +8838,8 @@ class MainWindow(QMainWindow):
         self._channels_dialog = None
         self._snapshot_windows = []
         self._console_dialog = None
+        self._logs_dialog = None
+        self._logs_pending = False
         self._video_device = None
         self._video_credentials = ("admin", "")
         self._system_payload = None
@@ -8730,8 +9022,7 @@ class MainWindow(QMainWindow):
         self.network_dns1_edit = IpAddressEdit()
         self.network_dns2_edit = IpAddressEdit()
         self.network_default_ip_button = QPushButton("Default IP")
-        self.network_default_ip_button.clicked.connect(
-            lambda: self.network_address_edit.setValue("192.168.1.10"))
+        self.network_default_ip_button.clicked.connect(self._set_default_ip)
         self.network_default_dns_button = QPushButton("Default DNS")
         self.network_default_dns_button.clicked.connect(self._set_default_dns)
         self.network_adaptive_check = QCheckBox("IP adaptive")
@@ -10373,6 +10664,11 @@ class MainWindow(QMainWindow):
         ssid = self.network_wifi_ssid_edit.itemText(index)
         self._message("Wi-Fi %s: %s / %s" % (
             ssid, entry.get("Auth") or "?", entry.get("EncrypType") or "?"))
+
+    def _set_default_ip(self):
+        self.network_address_edit.setValue("192.168.1.10")
+        self.network_submask_edit.setValue("255.255.255.0")
+        self.network_gateway_edit.setValue("192.168.1.1")
 
     def _set_default_dns(self):
         self.network_dns1_edit.setValue("77.88.8.8")
@@ -12692,32 +12988,55 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _view_logs(self):
-        self._start_system_action("logs", label="Reading logs from",
-                                  on_fetched=self._on_logs_fetched)
+        device = self._system_target()
+        if not isinstance(device, dict):
+            self._message("No device selected — pick a table row first.")
+            return
+        if self._logs_dialog is not None:
+            self._logs_dialog.show()
+            self._logs_dialog.raise_()
+            self._logs_dialog.activateWindow()
+            return
+        name = device.get("ip") or device.get("cloud_id") or ""
+        dialog = DeviceLogsDialog(name, self)
+        dialog.refresh_requested.connect(self._request_logs)
+        dialog.finished.connect(
+            lambda _result, d=dialog: self._forget_logs_dialog(d))
+        self._logs_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.refresh()
+
+    def _forget_logs_dialog(self, dialog):
+        if self._logs_dialog is dialog:
+            self._logs_dialog = None
+        self._logs_pending = False
+        dialog.deleteLater()
+
+    def _request_logs(self, begin, end):
+        if self._netip_thread is not None:
+            if self._logs_dialog is not None:
+                self._logs_dialog.set_error(
+                    tr("NetIP operation already running."))
+            return
+        self._logs_pending = True
+        self._start_system_action(
+            "logs", label="Reading logs from",
+            changes={"begin": begin, "end": end},
+            on_fetched=self._on_logs_fetched)
 
     def _on_logs_fetched(self, payload):
+        self._logs_pending = False
         reply = payload.get("logs")
         logs = reply.get("OPLogQuery") if isinstance(reply, dict) else None
         if not isinstance(logs, list):
             self._message("No logs returned.")
+            if self._logs_dialog is not None:
+                self._logs_dialog.set_error(tr("No logs returned."))
             return
-        lines = []
-        for log in logs:
-            if not isinstance(log, dict):
-                continue
-            lines.append("%s %10s %-12s %s" % (
-                log.get("Time", ""), log.get("User", ""),
-                log.get("Type", ""), log.get("Data", "")))
-        device = self._system_target()
-        name = device.get("ip") if isinstance(device, dict) else ""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Device logs — %s" % name)
-        dialog.resize(900, 600)
-        view = QPlainTextEdit("\n".join(lines))
-        view.setReadOnly(True)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(view)
-        dialog.show()
+        if self._logs_dialog is not None:
+            self._logs_dialog.set_logs(logs)
 
     def _erase_logs(self):
         device = self._system_target()
@@ -12860,7 +13179,9 @@ class MainWindow(QMainWindow):
                                          if info.get("DeviceType") is not None
                                          else common.get("DeviceType"))
             target["http_port"] = common.get("HttpPort") or target.get("http_port")
-            target["tcp_port"] = common.get("TCPPort") or target.get("tcp_port")
+            # Keep the port used to reach the device. Behind port forwarding
+            # it differs from the device's internal TCPPort, and overwriting
+            # it here would make later connections use the wrong port.
             self.model.upsert(target)
         network_keys = ("common", "dhcp", "adaptive", "dns", "smartnet", "wifi",
                         "rtsp", "online_upgrade", "upnp", "onvif_pwd", "pms", "ntp",
@@ -13138,6 +13459,10 @@ class MainWindow(QMainWindow):
     def _on_system_failed(self, text, thread=None):
         if thread is not None and thread is not self._netip_thread:
             return
+        if self._logs_pending:
+            self._logs_pending = False
+            if self._logs_dialog is not None:
+                self._logs_dialog.set_error(str(text))
         failed_identity = self._connected_identity or self._connect_pending
         if failed_identity is not None:
             self.db_panel.channels_failed(failed_identity, text)
@@ -13882,6 +14207,12 @@ class MainWindow(QMainWindow):
         if channels_dialog is not None:
             channels_dialog.close()
             channels_dialog.deleteLater()
+        logs_dialog = self._logs_dialog
+        self._logs_dialog = None
+        self._logs_pending = False
+        if logs_dialog is not None:
+            logs_dialog.close()
+            logs_dialog.deleteLater()
         self.video_panel.stop(wait=True)
         thread = self._thread
         self._thread = None

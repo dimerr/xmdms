@@ -80,12 +80,15 @@ ignored by the device.
 
 ## Maintenance and diagnostics
 
-- View and erase device logs.
+- View all device log pages in a table for a selected start/end date range
+  (last three days by default) and erase all logs.
 - Export/import device configuration files and reset selected configuration
   sections or perform a factory reset.
 - Upload firmware from a local file, or start the device's cloud upgrade.
 - Build an XM recovery image (`.img`) or a flat flash dump (`.dump`) from an
-  XM firmware `.bin` package for offline recovery work.
+  XM firmware `.bin` package for offline recovery work. Dumps can include a
+  crypto blob at a chosen offset (default `0x2FC00`) or immediately before a
+  detected u-boot environment partition.
 - Inspect raw NETIP request/response traffic in the **Query console**.
 - Synchronize device time, reboot devices and change passwords.
 
