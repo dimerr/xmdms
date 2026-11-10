@@ -29,6 +29,9 @@ single PySide6 UI.
 - Add devices manually by IP address and port, with per-device login and
   password.
 - Export the current inventory to CSV.
+- Optional SQLite/MySQL device directory with area grouping, field mapping,
+  hidden-device filtering, CMS password decryption, RPS cloud IDs and channel
+  playback.
 
 ## Bulk operations
 
@@ -62,6 +65,11 @@ ignored by the device.
 ## Live view and media
 
 - NETIP live video with selectable channel and Main/Sub stream.
+- Split playback grid (1/4/9/16/36 tiles) with blank tiles for channels the
+  device does not provide. Layouts above four tiles use the substream; double-
+  click a tile to maximize it on the main stream, and double-click again to
+  return to the grid.
+- The database device sidebar remembers whether it was open and its width.
 - Video decoding through QtMultimedia/FFmpeg by default, with optional PyAV or
   a system `ffmpeg` fallback. Set `XMDM_VIDEO_BACKEND=qt|av|ffmpeg` to force a
   backend.
@@ -96,8 +104,8 @@ ignored by the device.
 
 - Python 3.10 or newer for running from source (the Windows CI build uses
   Python 3.12).
-- `PySide6==6.9.*`, `psutil`, `cryptography` and `qrcode` from
-  `requirements.txt`.
+- `PySide6==6.9.*`, `psutil`, `cryptography`, `PyMySQL`, `pycryptodome`
+  and `qrcode` from `requirements.txt`.
 - The required NETIP client `dvrip.py` must be supplied next to `xmdms.py`;
   it is not installed from PyPI.
 - Optional: `av` for the PyAV video fallback, or a system `ffmpeg` executable
@@ -142,6 +150,8 @@ and macOS on every push and publishes releases from `main`.
 - The device table and credentials are session-only; the app does not persist
   either. Use **Export** to keep an inventory. Manual entries are lost when the
   application closes.
+- Database connection settings are stored locally, including the MySQL
+  password, so the connection can be restored after restart.
 - Available settings and actions depend on the device model and firmware.
 - Linux/macOS packaging is not provided; run the source with a graphical Qt
   environment.

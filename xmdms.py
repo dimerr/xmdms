@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -55,6 +56,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -67,6 +69,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -91,6 +94,7 @@ from PySide6.QtWidgets import (
     QTextBrowser,
     QTableWidgetItem,
     QTabWidget,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -166,6 +170,16 @@ try:
     import qrcode
 except ImportError:
     qrcode = None
+
+try:
+    from Crypto.Cipher import Blowfish as _Blowfish
+except ImportError:
+    _Blowfish = None
+
+try:
+    import pymysql
+except ImportError:
+    pymysql = None
 
 try:
     from PySide6.QtMultimedia import (
@@ -1907,6 +1921,8 @@ class NetipThread(QThread):
                         ("uart_protocol", "UartProtocol", 1360)):
                     read(name, command, command=command, code=code)
                 read("languages", "MultiLanguage", command="MultiLanguage", code=1360)
+                read("channel_titles", "ChannelTitle",
+                     source=lambda: camera.get_channel_titles())
                 read("users", "GetAllUser",
                      source=lambda: camera.send(1472, {"Name": "GetAllUser"}))
                 read("groups", "GetAllGroup",
@@ -1917,6 +1933,10 @@ class NetipThread(QThread):
                      source=lambda: None if dig_channels else camera.get_command(
                          "Simplify.Encode", 1042))
                 self.fetched.emit(payload)
+                return
+            if action == "set_channel_title":
+                camera.channel_title(self._changes.get("titles") or [])
+                self.applied.emit({"ChannelTitle": True})
                 return
             if action == "apply":
                 self.applied.emit(self._apply_general(camera, self._changes))
@@ -6430,8 +6450,9 @@ class VideoPanel(QWidget):
     jpeg_in = Signal(object)
     audio_in = Signal(object)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, compact=False):
         super().__init__(parent)
+        self._compact = bool(compact)
         self._thread = None
         self._image = None
         self._frame_size = None
@@ -6439,6 +6460,9 @@ class VideoPanel(QWidget):
         self._focus_last = 0.0
         self._stream = "Main"
         self._channel = 0
+        self._available_channels = 16
+        self._split_count = 1
+        self._split_active = False
         self._device = None
         self._username = "admin"
         self._password = ""
@@ -6467,15 +6491,16 @@ class VideoPanel(QWidget):
         self.codec = None
         self._backend = self._choose_backend()
 
+        minimum_video = QSize(48, 27) if compact else QSize(320, 180)
         self.video_label = QLabel("no video")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setMinimumSize(320, 180)
+        self.video_label.setMinimumSize(minimum_video)
         self.video_label.setStyleSheet("background-color: #101010; color: #808080;")
         self.video_view = VideoView() if QT_MULTIMEDIA else None
         self._stack = QStackedWidget()
         self._stack.addWidget(self.video_label)
         if self.video_view is not None:
-            self.video_view.setMinimumSize(320, 180)
+            self.video_view.setMinimumSize(minimum_video)
             self._stack.addWidget(self.video_view)
 
         self.mute_check = QCheckBox("Mute")
@@ -6504,7 +6529,8 @@ class VideoPanel(QWidget):
             "Point the camera at a detailed scene.")
         self.focus_button.toggled.connect(self._toggle_focus)
 
-        controls = QHBoxLayout()
+        self.controls_widget = QWidget()
+        controls = QHBoxLayout(self.controls_widget)
         controls.setContentsMargins(2, 0, 2, 0)
         controls.addWidget(self.mute_check)
         controls.addWidget(self.volume_slider)
@@ -6513,11 +6539,36 @@ class VideoPanel(QWidget):
         controls.addWidget(self.record_label)
         controls.addWidget(self.focus_button)
         controls.addStretch(1)
+        if not compact:
+            controls.addWidget(QLabel(tr("Split:")))
+            self.split_group = QButtonGroup(self)
+            self.split_group.setExclusive(True)
+            self.split_buttons = []
+            for count in (1, 4, 9, 16, 36):
+                button = QPushButton(str(count))
+                button.setCheckable(True)
+                button.setFixedWidth(30)
+                button.setEnabled(False)
+                self.split_group.addButton(button, count)
+                controls.addWidget(button)
+                self.split_buttons.append(button)
+                if count == 1:
+                    button.setChecked(True)
+            self.split_group.idClicked.connect(self._split_selected)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._stack, 1)
-        layout.addLayout(controls)
+        if compact:
+            layout.addWidget(self._stack, 1)
+        else:
+            self.view_stack = QStackedWidget()
+            self.view_stack.addWidget(self._stack)
+            self.split_wall = VideoWall(self)
+            self.split_wall.maximized_changed.connect(
+                self._on_wall_maximized)
+            self.view_stack.addWidget(self.split_wall)
+            layout.addWidget(self.view_stack, 1)
+            layout.addWidget(self.controls_widget)
         self.focus_overlay = FocusOverlay(self)
         self.focus_overlay.hide()
 
@@ -6537,7 +6588,8 @@ class VideoPanel(QWidget):
         if self._av_decoder is not None:
             self._av_decoder.image_ready.connect(self._on_image)
             self._av_decoder.failed.connect(self._on_decoder_failed)
-        self._audio = G711AudioPlayer(self) if QT_MULTIMEDIA else None
+        self._audio = (
+            G711AudioPlayer(self) if QT_MULTIMEDIA and not compact else None)
         self.mute_check.setChecked(True)
         self._watchdog = QTimer(self)
         self._watchdog.setSingleShot(True)
@@ -6796,7 +6848,9 @@ class VideoPanel(QWidget):
     def _position_focus_overlay(self):
         if not hasattr(self, "focus_overlay"):
             return
-        self.focus_overlay.setGeometry(self._stack.geometry())
+        target = (self._stack if self._compact
+                  else getattr(self, "view_stack", self._stack))
+        self.focus_overlay.setGeometry(target.geometry())
         if self.focus_button.isChecked():
             self.focus_overlay.raise_()
 
@@ -6809,7 +6863,7 @@ class VideoPanel(QWidget):
         self.focus_overlay.clear()
 
     def is_active(self):
-        return self._thread is not None
+        return self._thread is not None or self._split_active
 
     def start(self, device, username, password, stream="Main", channel=0):
         self.stop()
@@ -6821,6 +6875,106 @@ class VideoPanel(QWidget):
         self._fallback_started = False
         self._backend = self._choose_backend()
         return self._start_thread()
+
+    def set_available_channels(self, count):
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return
+        count = max(0, min(256, count))
+        if count < 1 or count == self._available_channels:
+            return
+        self._available_channels = count
+        if self._split_active:
+            self._start_split(self._split_count)
+
+    def _set_split_enabled(self, enabled):
+        if self._compact or not hasattr(self, "split_buttons"):
+            return
+        for button in self.split_buttons:
+            button.setEnabled(bool(enabled))
+
+    def _select_split_button(self, count):
+        if self._compact or not hasattr(self, "split_group"):
+            return
+        button = self.split_group.button(int(count))
+        if button is not None:
+            button.setChecked(True)
+
+    def _split_selected(self, count):
+        if self._compact:
+            return
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return
+        if count <= 1:
+            if not self._split_active:
+                self._select_split_button(1)
+                return
+            self._leave_split(wait=True)
+            self._split_count = 1
+            self._select_split_button(1)
+            if self._device is not None:
+                self._start_thread()
+            else:
+                self._set_split_enabled(False)
+            return
+        if self._device is None:
+            self._select_split_button(
+                self._split_count if self._split_active else 1)
+            return
+        if not self._split_active:
+            self._stop_main_stream()
+        self._start_split(count)
+
+    def _start_split(self, count):
+        if self._compact:
+            return False
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 4
+        if count not in (4, 9, 16, 36):
+            count = 4
+        self.split_wall.stop(wait=True)
+        self._split_count = count
+        self._split_active = True
+        self._reset_focus()
+        self.focus_button.setEnabled(False)
+        self._select_split_button(count)
+        self._set_split_enabled(True)
+        self.view_stack.setCurrentWidget(self.split_wall)
+        if self._device is None:
+            self._split_active = False
+            self._set_split_enabled(False)
+            self.view_stack.setCurrentWidget(self._stack)
+            self._select_split_button(1)
+            return False
+        stream = "Sub" if count > 4 else self._stream
+        self.split_wall.start(
+            self._device, self._username, self._password, stream,
+            count, self._available_channels)
+        self._set_status("%s %d — %s" % (
+            tr("Split view:"), count, tr(stream)))
+        return True
+
+    def _on_wall_maximized(self, maximized, index):
+        if maximized:
+            self._set_status("%s %d — %s" % (
+                tr("Maximized:"), index + 1, tr("Main")))
+            return
+        stream = "Sub" if self._split_count > 4 else self._stream
+        self._set_status("%s %d — %s" % (
+            tr("Split view:"), self._split_count, tr(stream)))
+
+    def _leave_split(self, wait=False):
+        if self._compact:
+            return
+        self.view_stack.setCurrentWidget(self._stack)
+        if self._split_active or self.split_wall.is_active():
+            self.split_wall.stop(wait=wait)
+        self._split_active = False
 
     def _start_thread(self):
         if not self.available():
@@ -6863,6 +7017,7 @@ class VideoPanel(QWidget):
         self._watchdog.start(6000)
         thread.start()
         self.focus_button.setEnabled(True)
+        self._set_split_enabled(True)
         return True
 
     def _on_keyframe(self):
@@ -6871,6 +7026,10 @@ class VideoPanel(QWidget):
         self.keyframe.emit()
 
     def switch(self, stream, channel):
+        if self._split_active:
+            self._stream = stream
+            self._channel = int(channel)
+            return self._start_split(self._split_count)
         if self._thread is None:
             return False
         if self._recorder.is_recording:
@@ -6902,6 +7061,14 @@ class VideoPanel(QWidget):
             self._switch_timer.stop()
 
     def stop(self, wait=False):
+        if not self._compact:
+            self._leave_split(wait=wait)
+            self._split_count = 1
+            self._select_split_button(1)
+            self._set_split_enabled(False)
+        self._stop_main_stream(wait=wait)
+
+    def _stop_main_stream(self, wait=False):
         self._active = False
         self._reset_focus()
         self._watchdog.stop()
@@ -7060,6 +7227,201 @@ class VideoPanel(QWidget):
             self._audio.set_volume(value / 100.0)
 
 
+class WallTile(QWidget):
+    """Container for one split tile; double-click maximizes it."""
+
+    activated = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        self.activated.emit()
+        event.accept()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.MouseButtonDblClick:
+            self.activated.emit()
+            return True
+        return super().eventFilter(watched, event)
+
+
+class VideoWall(QWidget):
+    """Grid of compact video tiles for split playback."""
+
+    COLUMNS = {4: 2, 9: 3, 16: 4, 36: 6}
+    lost = Signal(str)
+    notice = Signal(str)
+    maximized_changed = Signal(bool, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._views = QStackedWidget()
+        outer.addWidget(self._views)
+
+        self._grid_page = QWidget()
+        self._grid = QGridLayout(self._grid_page)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(2)
+        self._views.addWidget(self._grid_page)
+
+        self._max_page = QWidget()
+        self._max_layout = QVBoxLayout(self._max_page)
+        self._max_layout.setContentsMargins(0, 0, 0, 0)
+        self._max_layout.setSpacing(0)
+        self._views.addWidget(self._max_page)
+
+        self._views.setCurrentWidget(self._grid_page)
+        self._tiles = []
+        self._tile_by_index = {}
+        self._containers = []
+        self._columns = 2
+        self._max_container = None
+        self._max_index = None
+        self._active = False
+        self._device = None
+        self._username = "admin"
+        self._password = ""
+        self._stream = "Main"
+
+    def is_active(self):
+        return self._active
+
+    def is_maximized(self):
+        return self._max_container is not None
+
+    def toggle_maximized(self, index):
+        if self._max_container is not None:
+            self.restore_maximized()
+            return
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return
+        if not 0 <= index < len(self._containers):
+            return
+        container = self._containers[index]
+        tile = self._tile_by_index.get(index)
+        if tile is None or not tile.is_active():
+            return
+        self._grid.removeWidget(container)
+        container.setParent(self._max_page)
+        self._max_layout.addWidget(container)
+        self._max_container = container
+        self._max_index = index
+        self._views.setCurrentWidget(self._max_page)
+        # The maximized view always uses the main stream, even when the grid
+        # itself is running on substreams.
+        if tile._stream != "Main" or not tile.is_active():
+            self._start_tile(tile, index, "Main")
+        self.maximized_changed.emit(True, index)
+
+    def _start_tile(self, tile, index, stream):
+        if self._device is None:
+            return
+        tile.start(
+            self._device, self._username, self._password,
+            stream=stream, channel=index)
+
+    def restore_maximized(self):
+        container = self._max_container
+        index = self._max_index
+        if container is None or index is None:
+            return
+        self._max_layout.removeWidget(container)
+        self._grid.addWidget(
+            container, index // self._columns, index % self._columns)
+        tile = self._tile_by_index.get(index)
+        if tile is not None and (
+                tile._stream != self._stream or not tile.is_active()):
+            self._start_tile(tile, index, self._stream)
+        self._max_container = None
+        self._max_index = None
+        self._views.setCurrentWidget(self._grid_page)
+        self.maximized_changed.emit(False, index)
+
+    def start(self, device, username, password, stream, count, channels):
+        self.stop(wait=True)
+        self._device = device
+        self._username = username
+        self._password = password
+        self._stream = stream
+        count = max(1, min(36, int(count)))
+        channels = max(0, int(channels))
+        columns = self.COLUMNS.get(count)
+        if columns is None:
+            columns = max(1, int(math.ceil(math.sqrt(count))))
+        self._columns = columns
+        rows = (count + columns - 1) // columns
+        for column in range(columns):
+            self._grid.setColumnStretch(column, 1)
+        for row in range(rows):
+            self._grid.setRowStretch(row, 1)
+        for index in range(count):
+            container = WallTile()
+            container.activated.connect(
+                lambda idx=index: self.toggle_maximized(idx))
+            self._containers.append(container)
+            if index < channels:
+                layout = QVBoxLayout(container)
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(0)
+                label = QLabel(str(index + 1))
+                label.setStyleSheet(
+                    "color: #E0E0E0; background-color: #202020; "
+                    "padding: 1px 4px;")
+                tile = VideoPanel(container, compact=True)
+                tile.lost.connect(self.lost.emit)
+                tile.notice.connect(self.notice.emit)
+                layout.addWidget(label)
+                layout.addWidget(tile, 1)
+                tile.start(
+                    device, username, password, stream=stream,
+                    channel=index)
+                self._tiles.append(tile)
+                self._tile_by_index[index] = tile
+                container.setToolTip(tr("Double-click to maximize"))
+            else:
+                label = QLabel("—")
+                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                label.setStyleSheet(
+                    "color: #707070; background-color: #101010;")
+                layout = QVBoxLayout(container)
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.addWidget(label)
+            self._grid.addWidget(
+                container, index // columns, index % columns)
+            for child in container.findChildren(QWidget):
+                child.installEventFilter(container)
+        self._views.setCurrentWidget(self._grid_page)
+        self._active = True
+
+    def stop(self, wait=False):
+        self._max_container = None
+        self._max_index = None
+        self._views.setCurrentWidget(self._grid_page)
+        tiles = self._tiles
+        self._tiles = []
+        self._tile_by_index = {}
+        self._containers = []
+        # Tiles own their threads and media objects; stop them synchronously
+        # before the containing widgets are deleted.
+        for tile in tiles:
+            tile.stop(wait=True)
+        for layout in (self._grid, self._max_layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.hide()
+                    widget.deleteLater()
+        for column in range(self._grid.columnCount()):
+            self._grid.setColumnStretch(column, 0)
+        for row in range(self._grid.rowCount()):
+            self._grid.setRowStretch(row, 0)
+        self._device = None
+        self._active = False
+
+
 class QueryConsoleDialog(QDialog):
     def __init__(self, bus, parent=None):
         super().__init__(parent)
@@ -7152,6 +7514,1008 @@ class QueryConsoleDialog(QDialog):
     def _apply_fold(self):
         for index in range(self.tree.topLevelItemCount()):
             self._fold_item(self.tree.topLevelItem(index), 0)
+
+
+DB_FIELDS = ("area", "name", "host", "port", "username",
+             "password", "description", "hidden")
+DB_FIELD_LABELS = {
+    "area": "Area",
+    "name": "Name",
+    "host": "Host",
+    "port": "Port",
+    "username": "Username",
+    "password": "Password",
+    "description": "Description",
+    "hidden": "Hidden",
+}
+DB_SYNONYMS = {
+    "area": ("area", "group", "location", "zone", "region"),
+    "name": ("name", "title", "device", "device_name", "devicename"),
+    "host": ("host", "ip", "address", "ip_address", "ipaddress", "hostname"),
+    "port": ("port", "tcp_port", "tcpport", "netport"),
+    "username": ("username", "user", "login", "user_name"),
+    "password": ("password", "pass", "pwd"),
+    "description": ("description", "desc", "comment", "notes", "note"),
+    "hidden": ("hidden", "hide", "is_hidden", "disabled"),
+}
+DB_CONFIG_KEY = "database/config"
+DB_PANEL_VISIBLE_KEY = "database/panel_visible"
+DB_PANEL_WIDTH_KEY = "database/panel_width"
+CMS_KEY = b"\x01\x09\x07\x09\x01\x01\x01\x02"
+CMS_PATTERN = re.compile(r"^(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]+$")
+
+
+def default_database_config():
+    return {
+        "type": "sqlite",
+        "sqlite": "",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "user": "root",
+        "database": "",
+        "table": "",
+        "mapping": {},
+        "cms": False,
+    }
+
+
+def cms_decrypt_password(value):
+    text = db_text(value).strip()
+    if not text or _Blowfish is None or not CMS_PATTERN.match(text):
+        return text
+    try:
+        cipher = _Blowfish.new(CMS_KEY, _Blowfish.MODE_ECB)
+        padded = cipher.decrypt(bytearray.fromhex(text))
+        return padded.rstrip(b"\0").decode()
+    except Exception:
+        return text
+
+
+def db_quote_identifier(kind, value):
+    value = str(value)
+    if kind == "mysql":
+        return "`%s`" % value.replace("`", "``")
+    return '"%s"' % value.replace('"', '""')
+
+
+def db_connect(config, password=""):
+    kind = str(config.get("type") or "sqlite").lower()
+    if kind == "sqlite":
+        path = str(config.get("sqlite") or "").strip()
+        if not path:
+            raise ValueError("Select a SQLite database file.")
+        if not os.path.isfile(path):
+            raise ValueError("SQLite database file not found.")
+        connection = sqlite3.connect(path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        return connection
+    if kind == "mysql":
+        if pymysql is None:
+            raise RuntimeError("MySQL support requires PyMySQL.")
+        return pymysql.connect(
+            host=str(config.get("host") or "127.0.0.1").strip(),
+            port=int(config.get("port") or 3306),
+            user=str(config.get("user") or "").strip(),
+            password=password or "",
+            database=str(config.get("database") or "").strip(),
+            connect_timeout=5,
+            read_timeout=15,
+            write_timeout=15,
+            charset="utf8mb4",
+        )
+    raise ValueError("Unsupported database type.")
+
+
+def db_tables(connection, kind):
+    cursor = connection.cursor()
+    try:
+        if kind == "sqlite":
+            cursor.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name")
+        else:
+            cursor.execute("SHOW TABLES")
+        return [str(row[0]) for row in cursor.fetchall()]
+    finally:
+        cursor.close()
+
+
+def db_columns(connection, kind, table):
+    cursor = connection.cursor()
+    try:
+        if kind == "sqlite":
+            cursor.execute(
+                "PRAGMA table_info(%s)" % db_quote_identifier(kind, table))
+            return [str(row[1]) for row in cursor.fetchall()]
+        cursor.execute(
+            "SHOW COLUMNS FROM %s" % db_quote_identifier(kind, table))
+        return [str(row[0]) for row in cursor.fetchall()]
+    finally:
+        cursor.close()
+
+
+def db_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def db_truthy(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = db_text(value).strip().lower()
+    return text in ("1", "true", "yes", "y", "on", "hidden", "hide")
+
+
+def db_port(value):
+    try:
+        port = int(float(db_text(value).strip()))
+    except (TypeError, ValueError):
+        return 34567
+    if 1 <= port <= 65535:
+        return port
+    return 34567
+
+
+def db_load_devices(connection, config):
+    mapping = config.get("mapping") or {}
+    if not isinstance(mapping, dict):
+        mapping = {}
+    table = str(config.get("table") or "").strip()
+    host_column = str(mapping.get("host") or "").strip()
+    if not table:
+        raise ValueError("Select a table.")
+    if not host_column:
+        raise ValueError("Map the host field.")
+    columns = []
+    for key in DB_FIELDS:
+        column = str(mapping.get(key) or "").strip()
+        if column and column not in columns:
+            columns.append(column)
+    if not columns:
+        raise ValueError("Map at least the host field.")
+    kind = str(config.get("type") or "sqlite").lower()
+    query = "SELECT %s FROM %s" % (
+        ", ".join(db_quote_identifier(kind, column) for column in columns),
+        db_quote_identifier(kind, table))
+    cursor = connection.cursor()
+    try:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+    devices = []
+    hidden_count = 0
+    for row in rows:
+        values = {column: row[index] for index, column in enumerate(columns)}
+        hidden_column = str(mapping.get("hidden") or "").strip()
+        if hidden_column and db_truthy(values.get(hidden_column)):
+            hidden_count += 1
+            continue
+        host = db_text(values.get(host_column)).strip()
+        if not host:
+            continue
+        name_column = str(mapping.get("name") or "").strip()
+        area_column = str(mapping.get("area") or "").strip()
+        port_column = str(mapping.get("port") or "").strip()
+        user_column = str(mapping.get("username") or "").strip()
+        password_column = str(mapping.get("password") or "").strip()
+        description_column = str(mapping.get("description") or "").strip()
+        name = db_text(values.get(name_column)).strip() if name_column else ""
+        area = db_text(values.get(area_column)).strip() if area_column else ""
+        description = (db_text(values.get(description_column)).strip()
+                       if description_column else "")
+        username = (db_text(values.get(user_column)).strip()
+                    if user_column else "admin")
+        password = (db_text(values.get(password_column))
+                    if password_column else "")
+        if password and bool(config.get("cms")):
+            password = cms_decrypt_password(password)
+        port = db_port(values.get(port_column)) if port_column else 34567
+        try:
+            ipaddress.ip_address(host)
+            cloud_id = ""
+            address = host
+        except ValueError:
+            cloud_id = host
+            address = ""
+        device = manual_device(
+            address, port, username or "admin", password,
+            cloud_id=cloud_id, rps=bool(cloud_id))
+        device["host_raw"] = host
+        device["name"] = name or host
+        device["area"] = area
+        device["description"] = description
+        device["db_table"] = table
+        devices.append(device)
+    return devices, hidden_count
+
+
+class DatabaseDialog(QDialog):
+    def __init__(self, config=None, password="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(tr("Database connection"))
+        self.resize(680, 520)
+        self._saved_config = dict(config or {})
+        self._saved_mapping = dict(self._saved_config.get("mapping") or {})
+        self._saved_table = str(self._saved_config.get("table") or "")
+        self._result = None
+        self._password = password or ""
+        self._tables = []
+        self._columns = []
+
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("SQLite", "sqlite")
+        self.type_combo.addItem("MySQL", "mysql")
+        self.type_combo.currentIndexChanged.connect(self._type_changed)
+
+        self.sqlite_container = QWidget()
+        sqlite_grid = QGridLayout(self.sqlite_container)
+        sqlite_grid.setContentsMargins(0, 0, 0, 0)
+        self.sqlite_edit = QLineEdit()
+        self.sqlite_browse = QPushButton(tr("Browse..."))
+        self.sqlite_browse.clicked.connect(self._browse_sqlite)
+        sqlite_grid.addWidget(QLabel(tr("SQLite file:")), 0, 0)
+        sqlite_grid.addWidget(self.sqlite_edit, 0, 1)
+        sqlite_grid.addWidget(self.sqlite_browse, 0, 2)
+
+        self.mysql_container = QWidget()
+        mysql_grid = QGridLayout(self.mysql_container)
+        mysql_grid.setContentsMargins(0, 0, 0, 0)
+        self.host_edit = QLineEdit("127.0.0.1")
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(3306)
+        self.user_edit = QLineEdit("root")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setText(self._password)
+        self.database_edit = QLineEdit()
+        mysql_grid.addWidget(QLabel(tr("Host:")), 0, 0)
+        mysql_grid.addWidget(self.host_edit, 0, 1)
+        mysql_grid.addWidget(QLabel(tr("Port:")), 0, 2)
+        mysql_grid.addWidget(self.port_spin, 0, 3)
+        mysql_grid.addWidget(QLabel(tr("User:")), 1, 0)
+        mysql_grid.addWidget(self.user_edit, 1, 1)
+        mysql_grid.addWidget(QLabel(tr("Password:")), 1, 2)
+        mysql_grid.addWidget(self.password_edit, 1, 3)
+        mysql_grid.addWidget(QLabel(tr("Database:")), 2, 0)
+        mysql_grid.addWidget(self.database_edit, 2, 1, 1, 3)
+
+        self.connect_button = QPushButton(tr("Connect"))
+        self.connect_button.clicked.connect(self._connect)
+        self.status_label = QLabel(tr("Select a database and press Connect."))
+        self.status_label.setWordWrap(True)
+        connect_row = QHBoxLayout()
+        connect_row.addWidget(self.connect_button)
+        connect_row.addWidget(self.status_label, 1)
+
+        self.table_combo = QComboBox()
+        self.table_combo.setEnabled(False)
+        self.table_combo.currentIndexChanged.connect(self._table_changed)
+        table_row = QHBoxLayout()
+        table_row.addWidget(QLabel(tr("Table:")))
+        table_row.addWidget(self.table_combo, 1)
+
+        mapping_group = QGroupBox(tr("Field mapping"))
+        mapping_grid = QGridLayout(mapping_group)
+        mapping_grid.setHorizontalSpacing(8)
+        mapping_grid.setVerticalSpacing(4)
+        self.cms_check = QCheckBox("CMS")
+        self.cms_check.setToolTip(
+            tr("Decrypt CMS-encrypted password values"))
+        self.mapping_combos = {}
+        for index, key in enumerate(DB_FIELDS):
+            row = index // 2
+            column = (index % 2) * 2
+            combo = QComboBox()
+            combo.addItem(tr("(none)"), "")
+            combo.setMinimumWidth(150)
+            self.mapping_combos[key] = combo
+            mapping_grid.addWidget(
+                QLabel(tr(DB_FIELD_LABELS[key] + ":")), row, column)
+            if key == "password":
+                password_box = QWidget()
+                password_row = QHBoxLayout(password_box)
+                password_row.setContentsMargins(0, 0, 0, 0)
+                password_row.setSpacing(6)
+                password_row.addWidget(combo, 1)
+                password_row.addWidget(self.cms_check)
+                mapping_grid.addWidget(password_box, row, column + 1)
+            else:
+                mapping_grid.addWidget(combo, row, column + 1)
+        mapping_grid.setColumnStretch(1, 1)
+        mapping_grid.setColumnStretch(3, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        self._ok_button = buttons.button(
+            QDialogButtonBox.StandardButton.Ok)
+        self._ok_button.setEnabled(False)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel(tr("Type:")))
+        type_row.addWidget(self.type_combo, 1)
+        type_row.addStretch(1)
+        layout.addLayout(type_row)
+        layout.addWidget(self.sqlite_container)
+        layout.addWidget(self.mysql_container)
+        layout.addLayout(connect_row)
+        layout.addLayout(table_row)
+        layout.addWidget(mapping_group)
+        layout.addStretch(1)
+        layout.addWidget(buttons)
+
+        self._type_changed()
+        self._apply_saved()
+        if self._saved_config and (
+                str(self._saved_config.get("type") or "sqlite") == "sqlite"
+                or self._password):
+            QTimer.singleShot(0, self._connect)
+
+    def _browse_sqlite(self):
+        start = self.sqlite_edit.text().strip() or os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Select SQLite database"), start,
+            "SQLite database (*.db *.sqlite *.sqlite3);;All files (*)")
+        if path:
+            self.sqlite_edit.setText(path)
+
+    def _apply_saved(self):
+        config = self._saved_config
+        if not config:
+            return
+        index = self.type_combo.findData(str(config.get("type") or "sqlite"))
+        if index >= 0:
+            self.type_combo.blockSignals(True)
+            self.type_combo.setCurrentIndex(index)
+            self.type_combo.blockSignals(False)
+        self.sqlite_edit.setText(str(config.get("sqlite") or ""))
+        self.host_edit.setText(str(config.get("host") or "127.0.0.1"))
+        self.port_spin.setValue(int(config.get("port") or 3306))
+        self.user_edit.setText(str(config.get("user") or "root"))
+        self.database_edit.setText(str(config.get("database") or ""))
+        self.cms_check.setChecked(bool(config.get("cms")))
+        self._type_changed()
+
+    def _type_changed(self, *_):
+        kind = str(self.type_combo.currentData() or "sqlite")
+        self.sqlite_container.setVisible(kind == "sqlite")
+        self.mysql_container.setVisible(kind == "mysql")
+        self.table_combo.blockSignals(True)
+        self.table_combo.clear()
+        self.table_combo.blockSignals(False)
+        self.table_combo.setEnabled(False)
+        self._columns = []
+        self._fill_mapping([])
+        self._status(tr("Select a database and press Connect."))
+
+    def _status(self, text):
+        self.status_label.setText(text)
+
+    def _config(self):
+        kind = str(self.type_combo.currentData() or "sqlite")
+        mapping = {}
+        for key, combo in self.mapping_combos.items():
+            mapping[key] = str(combo.currentData() or "")
+        return {
+            "type": kind,
+            "sqlite": self.sqlite_edit.text().strip(),
+            "host": self.host_edit.text().strip(),
+            "port": int(self.port_spin.value()),
+            "user": self.user_edit.text().strip(),
+            "database": self.database_edit.text().strip(),
+            "table": self.table_combo.currentText().strip(),
+            "mapping": mapping,
+            "cms": bool(self.cms_check.isChecked()),
+        }
+
+    def _connection_config(self):
+        config = self._config()
+        config["table"] = ""
+        config["mapping"] = {}
+        return config
+
+    def _connect(self):
+        config = self._connection_config()
+        kind = config["type"]
+        if kind == "sqlite":
+            if not config["sqlite"] or not os.path.isfile(config["sqlite"]):
+                self._status(tr("Select an existing SQLite database file."))
+                return
+        elif not config["host"] or not config["user"] or not config["database"]:
+            self._status(tr("Enter the MySQL host, user and database."))
+            return
+        password = self.password_edit.text() if kind == "mysql" else ""
+        try:
+            connection = db_connect(config, password)
+            try:
+                tables = db_tables(connection, kind)
+            finally:
+                connection.close()
+        except Exception as error:
+            self._status(tr("Connection failed: ") + str(error))
+            return
+        self._tables = tables
+        self.table_combo.blockSignals(True)
+        self.table_combo.clear()
+        for table in tables:
+            self.table_combo.addItem(table, table)
+        self.table_combo.setEnabled(bool(tables))
+        self._columns = []
+        self._fill_mapping([])
+        if tables:
+            preferred = self._saved_table if self._saved_table in tables else tables[0]
+            self.table_combo.setCurrentIndex(tables.index(preferred))
+        self.table_combo.blockSignals(False)
+        if not tables:
+            self._status(tr("No tables found."))
+            self._ok_button.setEnabled(False)
+            return
+        self._load_columns()
+        if self._columns:
+            self._status(tr("Connected."))
+
+    def _table_changed(self, *_):
+        self._load_columns()
+
+    def _load_columns(self):
+        table = self.table_combo.currentText().strip()
+        if not table:
+            self._columns = []
+            self._fill_mapping([])
+            self._ok_button.setEnabled(False)
+            return
+        config = self._connection_config()
+        config["table"] = table
+        try:
+            connection = db_connect(
+                config,
+                self.password_edit.text()
+                if config["type"] == "mysql" else "")
+            try:
+                columns = db_columns(connection, config["type"], table)
+            finally:
+                connection.close()
+        except Exception as error:
+            self._columns = []
+            self._fill_mapping([])
+            self._ok_button.setEnabled(False)
+            self._status(tr("Connection failed: ") + str(error))
+            return
+        self._columns = columns
+        saved = self._saved_mapping if table == self._saved_table else {}
+        self._fill_mapping(columns, saved)
+        self._ok_button.setEnabled(bool(columns))
+
+    @staticmethod
+    def _auto_column(key, columns):
+        lowered = {column.lower(): column for column in columns}
+        for synonym in DB_SYNONYMS.get(key, ()):
+            if synonym in lowered:
+                return lowered[synonym]
+        for synonym in DB_SYNONYMS.get(key, ()):
+            for column in columns:
+                if synonym in column.lower():
+                    return column
+        return ""
+
+    def _fill_mapping(self, columns, saved=None):
+        saved = saved or {}
+        for key, combo in self.mapping_combos.items():
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(tr("(none)"), "")
+            for column in columns:
+                combo.addItem(column, column)
+            target = str(saved.get(key) or "") if saved else ""
+            if target not in columns:
+                target = self._auto_column(key, columns)
+            index = combo.findData(target)
+            combo.setCurrentIndex(max(0, index))
+            combo.blockSignals(False)
+
+    def _accept(self):
+        config = self._config()
+        if not self._columns or not config["table"]:
+            self._status(tr("Select a table first."))
+            return
+        if not config["mapping"].get("host"):
+            self._status(tr("Map the host field."))
+            return
+        self._result = config
+        self._password = (
+            self.password_edit.text()
+            if config["type"] == "mysql" else "")
+        super().accept()
+
+    def config(self):
+        return self._result or self._saved_config
+
+    def password(self):
+        return self._password
+
+
+class DatabasePanel(QWidget):
+    device_activated = Signal(dict)
+    channel_activated = Signal(dict, int, str)
+    message = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(270)
+        self.password = ""
+        self.config = self._read_config()
+        self._devices = []
+        self._hidden_count = 0
+        self._loaded = False
+        self._channel_counts = {}
+        self._channel_titles = {}
+        self._titles_ready = set()
+        self._device_items = {}
+        self._title_threads = []
+        self._loading = set()
+
+        self.title_label = QLabel(tr("Devices"))
+        title_font = self.title_label.font()
+        title_font.setBold(True)
+        self.title_label.setFont(title_font)
+
+        self.configure_button = QToolButton()
+        self.configure_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.configure_button.setIcon(self._gear_icon())
+        self.configure_button.setIconSize(QSize(16, 16))
+        self.configure_button.setFixedSize(24, 24)
+        self.configure_button.setAutoRaise(True)
+        self.configure_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.configure_button.setToolTip(tr("Database connection"))
+        self.configure_button.clicked.connect(self.configure)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(self.title_label)
+        header.addStretch(1)
+        header.addWidget(self.configure_button)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(1)
+        self.tree.setHeaderHidden(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.header().setStretchLastSection(True)
+        self.tree.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tree.setToolTip(tr("Double-click a device to connect and load channels."))
+        self.tree.itemDoubleClicked.connect(self._activate)
+        self.tree.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._context_menu)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setProperty("i18nDynamic", True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addLayout(header)
+        layout.addWidget(self.tree, 1)
+        layout.addWidget(self.status_label)
+
+        self._update_initial_status()
+
+    @staticmethod
+    def _gear_icon():
+        size = 16
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor("#5A5A5A"), 1.5))
+        center = size / 2.0
+        for index in range(8):
+            angle = index * math.pi / 4.0
+            inner = 3.7
+            outer = 6.4
+            painter.drawLine(
+                int(round(center + math.cos(angle) * inner)),
+                int(round(center + math.sin(angle) * inner)),
+                int(round(center + math.cos(angle) * outer)),
+                int(round(center + math.sin(angle) * outer)))
+        painter.drawEllipse(QRectF(3.3, 3.3, 9.4, 9.4))
+        painter.drawEllipse(QRectF(6.4, 6.4, 3.2, 3.2))
+        painter.end()
+        return QIcon(pixmap)
+
+    def _read_config(self):
+        raw = QSettings("xmdm3", "xmdms").value(DB_CONFIG_KEY, "")
+        config = default_database_config()
+        if isinstance(raw, str) and raw.strip():
+            try:
+                data = json.loads(raw)
+            except (TypeError, ValueError):
+                data = {}
+            if isinstance(data, dict):
+                config.update(data)
+        self.password = str(config.pop("password", "") or "")
+        return config
+
+    def _save_config(self):
+        settings = QSettings("xmdm3", "xmdms")
+        saved = dict(self.config)
+        saved["password"] = self.password
+        settings.setValue(DB_CONFIG_KEY, json.dumps(saved))
+        settings.sync()
+
+    def _configured(self):
+        kind = str(self.config.get("type") or "sqlite")
+        if kind == "sqlite":
+            return bool(str(self.config.get("sqlite") or "").strip())
+        return bool(str(self.config.get("host") or "").strip()
+                    and str(self.config.get("database") or "").strip())
+
+    def _update_initial_status(self):
+        if self._configured():
+            self.status_label.setText(tr("Database configured."))
+        else:
+            self.status_label.setText(tr("No database configured."))
+
+    def retranslate(self):
+        self.title_label.setText(tr("Devices"))
+        self.configure_button.setToolTip(tr("Database connection"))
+        for identity, item in self._device_items.items():
+            titles = self._channel_titles.get(identity) or []
+            for index in range(item.childCount()):
+                child = item.child(index)
+                data = child.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict) and data.get("kind") == "channel":
+                    child.setText(
+                        0, self._channel_label(
+                            index + 1,
+                            titles[index] if index < len(titles) else ""))
+        if self._loaded:
+            self._update_status()
+        else:
+            self._update_initial_status()
+
+    def configure(self):
+        dialog = DatabaseDialog(self.config, self.password, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.config = dialog.config()
+        self.password = dialog.password()
+        self._save_config()
+        self.refresh()
+
+    def ensure_loaded(self):
+        if self._loaded or not self._configured():
+            return
+        if (str(self.config.get("type") or "sqlite") == "sqlite"
+                or self.password):
+            self.refresh()
+        else:
+            self.status_label.setText(
+                tr("Open Configure and enter the database password."))
+
+    def refresh(self):
+        if not self._configured():
+            self.configure()
+            return
+        self.stop()
+        self._channel_counts.clear()
+        self._channel_titles.clear()
+        self._titles_ready.clear()
+        self._loading.clear()
+        self.status_label.setText(tr("Loading..."))
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            connection = db_connect(self.config, self.password)
+            try:
+                devices, hidden_count = db_load_devices(
+                    connection, self.config)
+            finally:
+                connection.close()
+        except Exception as error:
+            self._loaded = False
+            self._devices = []
+            self.tree.clear()
+            self.status_label.setText(
+                tr("Database error: ") + str(error))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._devices = devices
+        self._hidden_count = hidden_count
+        self._loaded = True
+        self._populate()
+        self.message.emit(tr("Database loaded."))
+
+    def _populate(self):
+        self.tree.clear()
+        self._device_items = {}
+        groups = {}
+        for device in self._devices:
+            area = str(device.get("area") or "").strip() or tr("Ungrouped")
+            group = groups.get(area)
+            if group is None:
+                group = QTreeWidgetItem([area])
+                font = group.font(0)
+                font.setBold(True)
+                group.setFont(0, font)
+                self.tree.addTopLevelItem(group)
+                groups[area] = group
+            name = str(device.get("name")
+                       or device.get("host_raw")
+                       or device.get("ip")
+                       or device.get("cloud_id") or "")
+            item = QTreeWidgetItem([name])
+            item.setData(0, Qt.ItemDataRole.UserRole, device)
+            item.setToolTip(0, self._device_tooltip(device))
+            group.addChild(item)
+            self._device_items[DeviceTableModel.identity(device)] = item
+        for group in groups.values():
+            group.setExpanded(True)
+        self._update_status()
+
+    @staticmethod
+    def _device_tooltip(device):
+        lines = []
+        area = str(device.get("area") or "").strip()
+        host = str(device.get("host_raw") or device.get("ip")
+                   or device.get("cloud_id") or "").strip()
+        if area:
+            lines.append("%s: %s" % (tr("Area"), area))
+        lines.append("%s: %s" % (tr("Host"), host))
+        if device.get("cloud_id"):
+            lines.append(tr("Cloud/RPS"))
+        lines.append("%s: %s" % (
+            tr("Port"), device.get("tcp_port") or 34567))
+        username = str(device.get("username") or "").strip()
+        if username:
+            lines.append("%s: %s" % (tr("Username"), username))
+        password = str(device.get("password") or "")
+        if password:
+            lines.append("%s: %s" % (
+                tr("Password"),
+                password if passwords_visible() else "********"))
+        description = str(device.get("description") or "").strip()
+        if description:
+            lines.append("%s: %s" % (tr("Description"), description))
+        table = str(device.get("db_table") or "").strip()
+        if table:
+            lines.append("%s: %s" % (tr("Table"), table))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _channel_label(channel, title=""):
+        title = str(title or "").strip()
+        return "%d - %s" % (channel, title) if title else str(channel)
+
+    def _expand_channels(self, item, device):
+        identity = DeviceTableModel.identity(device)
+        count = int(self._channel_counts.get(identity, 16))
+        count = max(1, min(256, count))
+        titles = self._channel_titles.get(identity) or []
+        children_ok = item.childCount() == count
+        if children_ok:
+            for index in range(item.childCount()):
+                data = item.child(index).data(
+                    0, Qt.ItemDataRole.UserRole)
+                if not isinstance(data, dict) or data.get("kind") != "channel":
+                    children_ok = False
+                    break
+        if not children_ok:
+            item.takeChildren()
+            for channel in range(1, count + 1):
+                title = titles[channel - 1] if channel - 1 < len(titles) else ""
+                child = QTreeWidgetItem(
+                    [self._channel_label(channel, title)])
+                child.setData(0, Qt.ItemDataRole.UserRole, {
+                    "kind": "channel",
+                    "channel": channel,
+                    "device": device,
+                })
+                child.setToolTip(
+                    0, tr("Double-click a channel to start playback."))
+                item.addChild(child)
+        item.setExpanded(True)
+
+    def set_channel_count(self, identity, count):
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return
+        if count < 1:
+            return
+        self._channel_counts[identity] = min(256, count)
+        item = self._device_items.get(identity)
+        if item is not None and item.childCount():
+            first = item.child(0).data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(first, dict) and first.get("kind") == "channel":
+                device = item.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(device, dict):
+                    self._expand_channels(item, device)
+
+    def _update_status(self):
+        if self._devices:
+            text = "%d %s" % (len(self._devices), tr("device(s)"))
+            if self._hidden_count:
+                text += " — %d %s" % (self._hidden_count, tr("hidden"))
+            self.status_label.setText(text)
+        elif self._hidden_count:
+            self.status_label.setText(
+                "0 %s — %d %s" % (
+                    tr("device(s)"), self._hidden_count, tr("hidden")))
+        else:
+            self.status_label.setText(tr("No devices"))
+
+    def _activate(self, item, _column):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        if data.get("kind") == "channel":
+            device = data.get("device")
+            if isinstance(device, dict):
+                self.channel_activated.emit(
+                    dict(device), int(data.get("channel") or 0), "Main")
+            return
+        self.device_activated.emit(dict(data))
+
+    @staticmethod
+    def _titles_list(value):
+        if isinstance(value, dict):
+            value = value.get("ChannelTitle") or []
+        if not isinstance(value, list):
+            return []
+        return [str(item or "").strip() for item in value]
+
+    def begin_connect(self, identity):
+        self._loading.add(identity)
+        item = self._device_items.get(identity)
+        self._channel_counts.pop(identity, None)
+        self._channel_titles.pop(identity, None)
+        self._titles_ready.discard(identity)
+        if item is not None:
+            item.takeChildren()
+            loading = QTreeWidgetItem([tr("Connecting...")])
+            loading.setFlags(
+                loading.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            item.addChild(loading)
+            item.setExpanded(True)
+        self.status_label.setText(tr("Connecting..."))
+
+    def channels_failed(self, identity, text):
+        if identity not in self._loading:
+            return
+        self._loading.discard(identity)
+        self._channels_failed(identity, text)
+
+    def _channels_failed(self, identity, text):
+        item = self._device_items.get(identity)
+        if item is not None:
+            item.takeChildren()
+        self.status_label.setText(tr("Connection failed: ") + str(text))
+
+    def is_loading(self, identity):
+        return identity in self._loading
+
+    def set_channels(self, identity, count, titles=()):
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return
+        if count < 1:
+            return
+        count = min(256, count)
+        self._loading.discard(identity)
+        self._channel_counts[identity] = count
+        self._channel_titles[identity] = list(titles)[:count]
+        if titles and len(titles) >= count:
+            self._titles_ready.add(identity)
+        else:
+            self._titles_ready.discard(identity)
+        item = self._device_items.get(identity)
+        if item is not None:
+            device = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(device, dict):
+                item.takeChildren()
+                self._expand_channels(item, device)
+        self._update_status()
+
+    def stop(self):
+        for thread in list(self._title_threads):
+            thread.cancel()
+            thread.wait(2000)
+        self._title_threads = []
+
+    def _context_menu(self, point):
+        item = self.tree.itemAt(point)
+        if item is None:
+            return
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        menu = QMenu(self)
+        if data.get("kind") == "channel":
+            device = data.get("device")
+            channel = int(data.get("channel") or 0)
+            if not isinstance(device, dict) or channel < 1:
+                return
+            main = menu.addAction(tr("Main"))
+            main.triggered.connect(
+                lambda: self.channel_activated.emit(
+                    dict(device), channel, "Main"))
+            sub = menu.addAction(tr("Sub"))
+            sub.triggered.connect(
+                lambda: self.channel_activated.emit(
+                    dict(device), channel, "Sub"))
+            rename = menu.addAction(tr("Rename"))
+            rename.triggered.connect(
+                lambda: self._rename_channel(item, device, channel))
+        else:
+            connect = menu.addAction(tr("Connect"))
+            connect.triggered.connect(
+                lambda: self.device_activated.emit(dict(data)))
+            copy = menu.addAction(tr("Copy address"))
+            copy.triggered.connect(
+                lambda: QApplication.clipboard().setText(
+                    str(data.get("ip") or data.get("cloud_id") or "")))
+        menu.exec(self.tree.viewport().mapToGlobal(point))
+
+    def _rename_channel(self, item, device, channel):
+        identity = DeviceTableModel.identity(device)
+        titles = list(self._channel_titles.get(identity) or [])
+        while len(titles) < channel:
+            titles.append("")
+        text, accepted = QInputDialog.getText(
+            self, tr("Rename channel"), tr("Channel title:"),
+            text=titles[channel - 1])
+        if not accepted:
+            return
+        titles[channel - 1] = text.strip()
+        self._channel_titles[identity] = titles
+        item.setText(0, self._channel_label(channel, titles[channel - 1]))
+        count = int(self._channel_counts.get(identity, len(titles)) or len(titles))
+        if identity in self._titles_ready and len(titles) >= count:
+            self._send_channel_titles(device, titles)
+
+    def _send_channel_titles(self, device, titles):
+        if not titles:
+            return
+        thread = NetipThread(
+            "set_channel_title",
+            device.get("ip") or "",
+            str(device.get("username") or "admin"),
+            str(device.get("password") or ""),
+            cloud_id=device.get("cloud_id") or "",
+            rps=bool(device.get("rps", True)),
+            changes={"titles": list(titles)},
+            port=int(device.get("tcp_port") or 34567),
+            no_md5=bool(device.get("no_md5")),
+            parent=self)
+        thread.applied.connect(
+            lambda _result: self.status_label.setText(
+                tr("Channel renamed.")))
+        thread.failed.connect(
+            lambda text: self.status_label.setText(
+                tr("Rename failed: ") + str(text)))
+        thread.finished.connect(
+            lambda: self._title_threads.remove(thread)
+            if thread in self._title_threads else None)
+        thread.finished.connect(thread.deleteLater)
+        self._title_threads.append(thread)
+        thread.start()
 
 
 class MainWindow(QMainWindow):
@@ -7345,6 +8709,10 @@ class MainWindow(QMainWindow):
         bottom.addStretch(1)
 
         self.video_panel = VideoPanel()
+        self.db_panel = DatabasePanel(self)
+        self.db_panel.device_activated.connect(self._connect_database_device)
+        self.db_panel.channel_activated.connect(self._play_database_channel)
+        self.db_panel.message.connect(self._message)
         self.table_stack = QStackedWidget()
         self.table_stack.addWidget(self.table)
         self.table_stack.addWidget(self.video_panel)
@@ -8542,11 +9910,15 @@ class MainWindow(QMainWindow):
 
         right_panel.setFixedWidth(470)
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self.db_panel)
         splitter.addWidget(table_panel)
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([900, 470])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([0, 900, 470])
+        self.main_splitter = splitter
+        self.db_panel.setVisible(False)
 
         layout = QVBoxLayout()
         layout.addLayout(controls)
@@ -8554,6 +9926,18 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
+
+        self.db_handle = QToolButton(container)
+        self.db_handle.setAutoRaise(True)
+        self.db_handle.setFixedSize(12, 38)
+        self.db_handle.setIconSize(QSize(9, 9))
+        self.db_handle.setArrowType(Qt.ArrowType.RightArrow)
+        self.db_handle.setToolTip(tr("Toggle database devices panel"))
+        self.db_handle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.db_handle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.db_handle.clicked.connect(self._toggle_database_panel)
+        self.db_handle.raise_()
+        QTimer.singleShot(0, self._position_db_handle)
 
         self.status_bar = QStatusBar(self)
         self.setStatusBar(self.status_bar)
@@ -8608,6 +9992,23 @@ class MainWindow(QMainWindow):
         retranslate_widgets(self)
         self._update_language_combo_labels()
         self._fit_system_buttons()
+        self._restore_database_panel_state()
+
+    def _position_db_handle(self):
+        if not hasattr(self, "db_handle"):
+            return
+        splitter = getattr(self, "main_splitter", None)
+        container = self.centralWidget()
+        if splitter is None or container is None:
+            return
+        rect = splitter.geometry()
+        y = rect.top() + max(0, (rect.height() - self.db_handle.height()) // 2)
+        self.db_handle.move(0, y)
+        self.db_handle.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_db_handle()
 
     def _message(self, text):
         self.fetch_label.setText(tr(text))
@@ -8626,6 +10027,161 @@ class MainWindow(QMainWindow):
     def _set_status(self, text):
         self._status_text = text
         self.status_label.setText(self._refresh_status_text())
+
+    @staticmethod
+    def _settings_flag(value):
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in (
+            "1", "true", "yes", "on")
+
+    def _restore_database_panel_state(self):
+        settings = QSettings("xmdm3", "xmdms")
+        visible = self._settings_flag(
+            settings.value(DB_PANEL_VISIBLE_KEY, False))
+        try:
+            width = int(settings.value(DB_PANEL_WIDTH_KEY, 0) or 0)
+        except (TypeError, ValueError):
+            width = 0
+        if width < 240:
+            width = 300
+        width = min(600, width)
+        if visible:
+            sizes = self.main_splitter.sizes()
+            total = sum(sizes) if sum(sizes) > 0 else 1600
+            self.main_splitter.setSizes([
+                width, max(320, total - width - 470), 470])
+        self.db_panel.setVisible(visible)
+        self.db_handle.setArrowType(
+            Qt.ArrowType.LeftArrow if visible else Qt.ArrowType.RightArrow)
+        if visible:
+            QTimer.singleShot(0, self._sync_minimum_size)
+            QTimer.singleShot(0, self.db_panel.ensure_loaded)
+
+    def _save_database_panel_state(self):
+        if not hasattr(self, "db_panel") or not hasattr(self, "main_splitter"):
+            return
+        settings = QSettings("xmdm3", "xmdms")
+        visible = self.db_panel.isVisible()
+        settings.setValue(DB_PANEL_VISIBLE_KEY, visible)
+        sizes = self.main_splitter.sizes()
+        if visible and sizes and sizes[0] >= 240:
+            settings.setValue(DB_PANEL_WIDTH_KEY, int(sizes[0]))
+        settings.sync()
+
+    def _toggle_database_panel(self):
+        self._set_database_panel_visible(not self.db_panel.isVisible())
+
+    def _set_database_panel_visible(self, visible):
+        visible = bool(visible)
+        settings = QSettings("xmdm3", "xmdms")
+        if not visible:
+            sizes = self.main_splitter.sizes()
+            if sizes and sizes[0] >= 240:
+                settings.setValue(DB_PANEL_WIDTH_KEY, int(sizes[0]))
+        self.db_panel.setVisible(visible)
+        self.db_handle.setArrowType(
+            Qt.ArrowType.LeftArrow if visible else Qt.ArrowType.RightArrow)
+        QTimer.singleShot(0, self._sync_minimum_size)
+        if visible:
+            sizes = self.main_splitter.sizes()
+            if len(sizes) >= 3 and sizes[0] < 280:
+                try:
+                    saved_width = int(
+                        settings.value(DB_PANEL_WIDTH_KEY, 0) or 0)
+                except (TypeError, ValueError):
+                    saved_width = 0
+                total = sum(sizes)
+                if not 240 <= saved_width <= 600:
+                    saved_width = max(300, min(340, total // 5))
+                sizes[0] = saved_width
+                sizes[1] = max(320, total - saved_width - 470)
+                sizes[2] = 470
+                self.main_splitter.setSizes(sizes)
+            if sizes and len(sizes) >= 1 and sizes[0] >= 240:
+                settings.setValue(DB_PANEL_WIDTH_KEY, int(sizes[0]))
+            self.db_panel.ensure_loaded()
+        settings.setValue(DB_PANEL_VISIBLE_KEY, visible)
+        settings.sync()
+
+    def _sync_minimum_size(self):
+        self.setMinimumSize(self.minimumSizeHint())
+
+    def _play_database_channel(self, device, channel, stream="Main"):
+        if not isinstance(device, dict):
+            return
+        try:
+            channel = int(channel)
+        except (TypeError, ValueError):
+            return
+        stream = "Sub" if str(stream).lower() == "sub" else "Main"
+        if channel < 1 or not VideoPanel.available():
+            self._message("No video decoder is available.")
+            return
+        if self.video_panel.is_active():
+            self._stop_video()
+        self.model.upsert(device)
+        identity = DeviceTableModel.identity(device)
+        row = next(
+            (index for index in range(self.model.rowCount())
+             if DeviceTableModel.identity(self.model.device_at(index))
+             == identity), -1)
+        if row >= 0:
+            self.table.selectRow(row)
+            device = self.model.device_at(row) or device
+        self._set_channel_count(max(channel, self._channel_count))
+        index = self.channel_combo.findData(channel)
+        if index >= 0:
+            self.channel_combo.blockSignals(True)
+            self.channel_combo.setCurrentIndex(index)
+            self.channel_combo.blockSignals(False)
+        if stream == "Sub":
+            self.stream_sub_radio.setChecked(True)
+        else:
+            self.stream_main_radio.setChecked(True)
+        username, password = self._device_credentials(device)
+        started = self.video_panel.start(
+            device, username, password, stream=stream,
+            channel=channel - 1)
+        if not started:
+            return
+        self._video_device = device
+        self._video_credentials = (username, password)
+        self.table_stack.setCurrentWidget(self.video_panel)
+        self.video_button.setText("STOP VIDEO")
+        self.middle_stack.setCurrentWidget(self.video_status_label)
+        label = device.get("cloud_id") or device.get("ip") or "device"
+        self._message("NETIP video: %s %s channel %d" % (
+            label, stream, channel))
+
+    def _connect_database_device(self, device):
+        if not isinstance(device, dict):
+            return
+        host = str(
+            device.get("ip") or device.get("cloud_id") or "").strip()
+        if not host:
+            self._message("Database device has no host.")
+            return
+        identity = DeviceTableModel.identity(device)
+        self.db_panel.begin_connect(identity)
+        self.model.upsert(device)
+        row = next(
+            (index for index in range(self.model.rowCount())
+             if DeviceTableModel.identity(self.model.device_at(index))
+             == identity), -1)
+        if row < 0:
+            return
+        self.table.selectRow(row)
+        if self._connected_identity == identity:
+            payload = (self._fetched_payload
+                       if self._fetched_identity == identity else None)
+            if payload is not None:
+                self._on_system_fetched(payload, quiet=True)
+                if "channel_titles" in payload:
+                    return
+            self._request_fetch({"system", "channel_titles"})
+            return
+        self._connect_device(self.model.index(row, 0))
 
     def _toggle_search(self, checked):
         source = "Stop" if checked else "Search"
@@ -9024,7 +10580,10 @@ class MainWindow(QMainWindow):
             if self._select_device_identity(self._connected_identity):
                 return
         self.initial_ip_edit.setValue(next_ip_address(device.get("ip")))
-        self._set_channel_count((device.get("raw") or {}).get("ChannelNum"))
+        channels = (device.get("raw") or {}).get("ChannelNum")
+        self._set_channel_count(channels)
+        self.db_panel.set_channel_count(
+            DeviceTableModel.identity(device), channels)
         connected = (self._connected_identity is not None
                      and identity == self._connected_identity)
         if (connected and self._fetched_payload is not None
@@ -9384,7 +10943,7 @@ class MainWindow(QMainWindow):
         self._start_session(device)
         label = "Switching to" if previous is not None and previous != identity else "Connecting to"
         keys = sorted(set(self._tab_fetch_keys(self.tabs.currentIndex()))
-                      | {"system", "common"})
+                      | {"system", "common", "channel_titles"})
         self._start_system_action(
             "fetch", device=device, label=label, changes={"keys": keys})
 
@@ -9551,6 +11110,8 @@ class MainWindow(QMainWindow):
         self._save_setting("language", setting)
         set_language(resolve_language(setting))
         retranslate_windows()
+        self.db_panel.retranslate()
+        self._sync_minimum_size()
         self.about_notes.setPlaceholderText(tr("No release notes."))
         self._render_about_state()
         self._update_language_combo_labels()
@@ -11372,6 +12933,16 @@ class MainWindow(QMainWindow):
             self.system_channels_edit.setText(
                 "" if channels is None else str(channels))
             self._set_channel_count(channels)
+            if self._connected_identity is not None:
+                identity = self._connected_identity
+                if ("channel_titles" in payload
+                        or self.db_panel.is_loading(identity)):
+                    titles = self.db_panel._titles_list(
+                        payload.get("channel_titles"))
+                    self.db_panel.set_channels(
+                        identity, channels or len(titles) or 16, titles)
+                else:
+                    self.db_panel.set_channel_count(identity, channels)
         if "general" in payload:
             self._system_general_keys = {}
             location = general.get("Location") if isinstance(
@@ -11567,6 +13138,9 @@ class MainWindow(QMainWindow):
     def _on_system_failed(self, text, thread=None):
         if thread is not None and thread is not self._netip_thread:
             return
+        failed_identity = self._connected_identity or self._connect_pending
+        if failed_identity is not None:
+            self.db_panel.channels_failed(failed_identity, text)
         if self._connect_pending is not None:
             self.model.set_connected(self._connect_pending, False)
             if self._connected_identity == self._connect_pending:
@@ -11699,7 +13273,11 @@ class MainWindow(QMainWindow):
             return
         self._channel_count = count
         self._update_channels_button()
-        if count < 1 or self.channel_combo.count() == count:
+        if count < 1:
+            return
+        if hasattr(self, "video_panel"):
+            self.video_panel.set_available_channels(count)
+        if self.channel_combo.count() == count:
             return
         current = self.channel_combo.currentData()
         self.channel_combo.blockSignals(True)
@@ -12295,7 +13873,10 @@ class MainWindow(QMainWindow):
             self.search_button.setChecked(False)
 
     def closeEvent(self, event):
+        self._save_database_panel_state()
         self._stop_session()
+        if hasattr(self, "db_panel"):
+            self.db_panel.stop()
         channels_dialog = self._channels_dialog
         self._channels_dialog = None
         if channels_dialog is not None:
