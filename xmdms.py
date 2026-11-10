@@ -8861,6 +8861,9 @@ class MainWindow(QMainWindow):
         self._console_dialog = None
         self._logs_dialog = None
         self._logs_pending = False
+        self._db_panel_width = 300
+        self._db_panel_open = False
+        self._db_panel_shift = 0
         self._video_device = None
         self._video_credentials = ("admin", "")
         self._system_payload = None
@@ -10231,10 +10234,13 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([0, 900, 470])
+        splitter.setHandleWidth(1)
         self.main_splitter = splitter
         self.db_panel.setVisible(False)
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
         layout.addLayout(controls)
         layout.addWidget(splitter, 1)
         container = QWidget()
@@ -10354,9 +10360,23 @@ class MainWindow(QMainWindow):
         return screen.availableGeometry().height()
 
     def _fit_window_to_screen(self):
-        self._sync_minimum_size()
+        # Use the wrapped-tab minimum width, but leave the height unconstrained
+        # until the layout is shown so the window can be manually downsized.
+        hint = self.minimumSizeHint()
+        self.setMinimumSize(hint.width(), 200)
+        natural = getattr(
+            self, "_natural_min_height",
+            self.minimumSizeHint().height())
+        available = self._available_screen_height()
+        if available:
+            natural = min(natural, max(480, available - 40))
         width = max(self.width(), self.minimumWidth())
-        self.resize(width, self.minimumHeight())
+        self.resize(width, max(200, natural))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._position_db_handle)
+        QTimer.singleShot(0, self._sync_minimum_size)
 
     def _position_db_handle(self):
         if not hasattr(self, "db_handle"):
@@ -10399,6 +10419,14 @@ class MainWindow(QMainWindow):
         return str(value or "").strip().lower() in (
             "1", "true", "yes", "on")
 
+    def _refresh_main_layout(self):
+        self.main_splitter.updateGeometry()
+        container = self.centralWidget()
+        layout = container.layout() if container is not None else None
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+
     def _restore_database_panel_state(self):
         settings = QSettings("xmdm3", "xmdms")
         visible = self._settings_flag(
@@ -10407,75 +10435,108 @@ class MainWindow(QMainWindow):
             width = int(settings.value(DB_PANEL_WIDTH_KEY, 0) or 0)
         except (TypeError, ValueError):
             width = 0
-        if width < 240:
+        if width < 270:
             width = 300
-        width = min(600, width)
+        self._db_panel_width = min(600, width)
+        self._db_panel_open = visible
+        self._db_panel_shift = self._db_panel_width if visible else 0
+        self.db_handle.setArrowType(
+            Qt.ArrowType.RightArrow if visible else Qt.ArrowType.LeftArrow)
         if visible:
             sizes = self.main_splitter.sizes()
             total = sum(sizes) if sum(sizes) > 0 else 1600
+            middle = sizes[1] if len(sizes) >= 3 else max(320, total - 470)
+            base_width = max(
+                self.width(), self.minimumSizeHint().width())
+            self.db_panel.setVisible(True)
+            self._refresh_main_layout()
+            self._sync_minimum_size()
             self.main_splitter.setSizes([
-                width, max(320, total - width - 470), 470])
-        self.db_panel.setVisible(visible)
-        self.db_handle.setArrowType(
-            Qt.ArrowType.LeftArrow if visible else Qt.ArrowType.RightArrow)
-        if visible:
-            QTimer.singleShot(0, self._sync_minimum_size)
+                self._db_panel_width, max(320, middle), 470])
+            if not self.isMaximized() and not self.isFullScreen():
+                self.resize(
+                    max(self.minimumWidth(),
+                        base_width + self._db_panel_width),
+                    self.height())
             QTimer.singleShot(0, self.db_panel.ensure_loaded)
+        else:
+            self.db_panel.setVisible(False)
 
     def _save_database_panel_state(self):
-        if not hasattr(self, "db_panel") or not hasattr(self, "main_splitter"):
+        if not hasattr(self, "db_panel"):
             return
         settings = QSettings("xmdm3", "xmdms")
-        visible = self.db_panel.isVisible()
-        settings.setValue(DB_PANEL_VISIBLE_KEY, visible)
+        settings.setValue(DB_PANEL_VISIBLE_KEY, self._db_panel_open)
         sizes = self.main_splitter.sizes()
-        if visible and sizes and sizes[0] >= 240:
+        if self._db_panel_open and sizes and sizes[0] >= 240:
             settings.setValue(DB_PANEL_WIDTH_KEY, int(sizes[0]))
+        else:
+            settings.setValue(
+                DB_PANEL_WIDTH_KEY, int(self._db_panel_width))
         settings.sync()
 
     def _toggle_database_panel(self):
-        self._set_database_panel_visible(not self.db_panel.isVisible())
+        self._set_database_panel_visible(not self._db_panel_open)
 
     def _set_database_panel_visible(self, visible):
         visible = bool(visible)
+        if visible == self._db_panel_open:
+            if visible:
+                self.db_panel.ensure_loaded()
+            return
+        self._db_panel_open = visible
         settings = QSettings("xmdm3", "xmdms")
-        if not visible:
-            sizes = self.main_splitter.sizes()
-            if sizes and sizes[0] >= 240:
-                settings.setValue(DB_PANEL_WIDTH_KEY, int(sizes[0]))
-        self.db_panel.setVisible(visible)
-        self.db_handle.setArrowType(
-            Qt.ArrowType.LeftArrow if visible else Qt.ArrowType.RightArrow)
-        QTimer.singleShot(0, self._sync_minimum_size)
         if visible:
             sizes = self.main_splitter.sizes()
-            if len(sizes) >= 3 and sizes[0] < 280:
-                try:
-                    saved_width = int(
-                        settings.value(DB_PANEL_WIDTH_KEY, 0) or 0)
-                except (TypeError, ValueError):
-                    saved_width = 0
-                total = sum(sizes)
-                if not 240 <= saved_width <= 600:
-                    saved_width = max(300, min(340, total // 5))
-                sizes[0] = saved_width
-                sizes[1] = max(320, total - saved_width - 470)
-                sizes[2] = 470
-                self.main_splitter.setSizes(sizes)
-            if sizes and len(sizes) >= 1 and sizes[0] >= 240:
-                settings.setValue(DB_PANEL_WIDTH_KEY, int(sizes[0]))
+            total = sum(sizes) if sum(sizes) > 0 else 1600
+            middle = sizes[1] if len(sizes) >= 3 else max(320, total - 470)
+            try:
+                saved_width = int(
+                    settings.value(DB_PANEL_WIDTH_KEY, 0) or 0)
+            except (TypeError, ValueError):
+                saved_width = 0
+            if not 270 <= saved_width <= 600:
+                saved_width = 300
+            self._db_panel_width = saved_width
+            self._db_panel_shift = 0
+            if not self.isMaximized() and not self.isFullScreen():
+                before = self.geometry()
+                self._db_panel_shift = saved_width
+                self.setGeometry(
+                    before.x() - saved_width, before.y(),
+                    before.width() + saved_width, before.height())
+            self.db_panel.setVisible(True)
+            self._refresh_main_layout()
+            self._sync_minimum_size()
+            self.main_splitter.setSizes([
+                saved_width, max(320, middle), 470])
             self.db_panel.ensure_loaded()
+        else:
+            sizes = self.main_splitter.sizes()
+            left = sizes[0] if sizes and sizes[0] >= 240 else self._db_panel_width
+            self._db_panel_width = left
+            self.db_panel.setVisible(False)
+            self._refresh_main_layout()
+            self._sync_minimum_size()
+            if not self.isMaximized() and not self.isFullScreen():
+                before = self.geometry()
+                new_x = before.x()
+                if self._db_panel_shift > 0:
+                    new_x += left
+                self.setGeometry(
+                    new_x, before.y(),
+                    max(self.minimumWidth(), before.width() - left),
+                    before.height())
+            self._db_panel_shift = 0
+        self.db_handle.setArrowType(
+            Qt.ArrowType.RightArrow if visible else Qt.ArrowType.LeftArrow)
+        self._position_db_handle()
         settings.setValue(DB_PANEL_VISIBLE_KEY, visible)
         settings.sync()
 
     def _sync_minimum_size(self):
         hint = self.minimumSizeHint()
-        natural = getattr(self, "_natural_min_height", hint.height())
-        height = max(hint.height(), natural)
-        available = self._available_screen_height()
-        if available:
-            height = min(height, max(480, available - 40))
-        self.setMinimumSize(hint.width(), height)
+        self.setMinimumSize(hint.width(), hint.height())
 
     def _play_database_channel(self, device, channel, stream="Main"):
         if not isinstance(device, dict):

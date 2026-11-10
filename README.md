@@ -70,6 +70,8 @@ ignored by the device.
   click a tile to maximize it on the main stream, and double-click again to
   return to the grid.
 - The database device sidebar remembers whether it was open and its width.
+  It extends the window to the left, keeping the device table width unchanged,
+  and moves with the window as part of the same window.
 - Video decoding through QtMultimedia/FFmpeg by default, with optional PyAV or
   a system `ffmpeg` fallback. Set `XMDM_VIDEO_BACKEND=qt|av|ffmpeg` to force a
   backend.
