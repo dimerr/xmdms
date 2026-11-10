@@ -219,6 +219,27 @@ CONNECTED_BRUSH = QBrush(QColor("#A5D6A7"))
 PROVISION_OK_BRUSH = QBrush(QColor("#A5D6A7"))
 PROVISION_FAILED_BRUSH = QBrush(QColor("#EF9A9A"))
 PROVISION_ACTIVE_BRUSH = QBrush(QColor("#FFF59D"))
+THIN_SCROLLBAR_STYLE = (
+    "QScrollBar:vertical {"
+    " background: transparent;"
+    " width: 6px;"
+    " margin: 0;"
+    "}"
+    "QScrollBar::handle:vertical {"
+    " background: rgba(128, 128, 128, 0.45);"
+    " min-height: 24px;"
+    " border-radius: 3px;"
+    "}"
+    "QScrollBar::handle:vertical:hover {"
+    " background: rgba(128, 128, 128, 0.7);"
+    "}"
+    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+    " height: 0;"
+    "}"
+    "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
+    " background: transparent;"
+    "}"
+)
 GROUP_BOX_STYLE = (
     "QGroupBox {"
     " border: 1px solid palette(mid);"
@@ -9413,6 +9434,8 @@ class MainWindow(QMainWindow):
         settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
         settings_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        settings_scroll.verticalScrollBar().setStyleSheet(
+            THIN_SCROLLBAR_STYLE)
         settings_scroll.setWidget(settings_panel)
         self._settings_scroll = settings_scroll
         saved_theme = str(QSettings("xmdm3", "xmdms").value(
@@ -10284,6 +10307,56 @@ class MainWindow(QMainWindow):
         self._update_language_combo_labels()
         self._fit_system_buttons()
         self._restore_database_panel_state()
+        # Keep the original comfortable window height on large screens, but
+        # allow the tab contents to scroll when the screen is smaller.
+        self._natural_min_height = self.minimumSizeHint().height()
+        self._make_device_tabs_scrollable()
+        self._fit_window_to_screen()
+
+    def _scrollable_tab(self, panel):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.verticalScrollBar().setStyleSheet(THIN_SCROLLBAR_STYLE)
+        scroll.setWidget(panel)
+        return scroll
+
+    def _make_device_tabs_scrollable(self):
+        entries = []
+        for index in range(self.tabs.count()):
+            panel = self.tabs.widget(index)
+            if panel is getattr(self, "_settings_scroll", None):
+                continue
+            entries.append((index, panel, self.tabs.tabText(index)))
+        if not entries:
+            return
+        current = self.tabs.currentIndex()
+        self.tabs.blockSignals(True)
+        try:
+            for index, _panel, _title in reversed(entries):
+                self.tabs.removeTab(index)
+            for offset, (_index, panel, title) in enumerate(entries):
+                self.tabs.insertTab(offset, self._scrollable_tab(panel), title)
+            if current >= 0:
+                self.tabs.setCurrentIndex(
+                    min(current, self.tabs.count() - 1))
+        finally:
+            self.tabs.blockSignals(False)
+
+    def _available_screen_height(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return 0
+        return screen.availableGeometry().height()
+
+    def _fit_window_to_screen(self):
+        self._sync_minimum_size()
+        width = max(self.width(), self.minimumWidth())
+        self.resize(width, self.minimumHeight())
 
     def _position_db_handle(self):
         if not hasattr(self, "db_handle"):
@@ -10396,7 +10469,13 @@ class MainWindow(QMainWindow):
         settings.sync()
 
     def _sync_minimum_size(self):
-        self.setMinimumSize(self.minimumSizeHint())
+        hint = self.minimumSizeHint()
+        natural = getattr(self, "_natural_min_height", hint.height())
+        height = max(hint.height(), natural)
+        available = self._available_screen_height()
+        if available:
+            height = min(height, max(480, available - 40))
+        self.setMinimumSize(hint.width(), height)
 
     def _play_database_channel(self, device, channel, stream="Main"):
         if not isinstance(device, dict):
