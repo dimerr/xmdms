@@ -21,7 +21,9 @@ single PySide6 UI.
   search attempts (probes). The search runs until stopped or the configured
   window expires.
 - Device table with IP, MAC, serial number, firmware version, build date and
-  host name. Columns are sortable and rows are selectable with checkboxes.
+  host name. Columns are sortable (IP by default) and have a per-column filter
+  row; select all/deselect all applies to the matching rows while filters are
+  active. Rows are selectable with checkboxes.
 - Search again removes devices that no longer answer, while manual entries are
   kept.
 - Double-click a row to connect. Right-click for copy, select all/deselect all,
@@ -52,15 +54,20 @@ single PySide6 UI.
 | **System** | Hardware/software/cloud ID, runtime age, channel count, device type, NAT status, TV standard, device language, restart schedule, time zone, date/time format, beeper, face/debug flags, audio input, cloud-ID QR code, time sync, reboot, config import/export/reset, device logs and firmware utilities. |
 | **Display** | Video output resolution, GUI feature flags and window alpha. |
 | **Encode** | Per-channel main stream and substream: H.264/H.265, resolution, FPS, CBR/VBR rate control, quality, bitrate, I-frame interval, smart H.265+/H.265AI, audio/video enable. Includes an all-channels editor. |
-| **Camera** | Day/night mode, white balance, BLC, aperture, exposure, shutter, gain, AE sensitivity, day/night noise filters, IR-cut, DNC threshold, DWDR, flip/mirror, flicker rejection and white-light controls. |
+| **Camera** | Day/night mode and switch schedule, white balance, BLC, aperture, exposure, shutter, gain, AE sensitivity, day/night noise filters, IR-cut, DNC threshold, DWDR, flip/mirror, flicker rejection and white-light controls. |
 | **Storage** | Disk list, read/write, read-only, redundant and snapshot modes, format and recover actions. |
 | **Users** | User and group lists, add/modify/delete users and groups, and change user passwords. |
 | **RS232/485/PTZ** | RS232 function and serial parameters, per-channel PTZ protocol/address/serial settings, and RS485 configuration. |
 | **Settings** | Theme, language, password masking, search timeout and search attempts. |
 
 Configuration is loaded from the device when a tab is opened and applied with
-**Save**. Unsupported options depend on device firmware and may be rejected or
-ignored by the device.
+**Save**. The single-channel Camera and Encode tabs apply only the selected
+channel. Their all-channels editors compare every row with the values loaded
+when the editor opened and send only the channels and sections that changed.
+Unsupported options depend on device firmware and may be rejected or ignored
+by the device. NETIP actions are queued instead of discarded while another
+action is running, live video can start while settings are still loading, and
+the status bar **Cancel** button stops the current and queued operations.
 
 ## Live view and media
 
@@ -87,6 +94,11 @@ ignored by the device.
 - Export/import device configuration files and reset selected configuration
   sections or perform a factory reset.
 - Upload firmware from a local file, or start the device's cloud upgrade.
+  Checked devices can be upgraded as a batch, with up to four uploads in
+  parallel. Device-side flashing continues in the background while the freed
+  upload slot starts the next device. Each device's progress is shown in the
+  Host Name column. Differing firmware versions among the selected devices
+  are flagged before starting.
 - Build an XM recovery image (`.img`) or a flat flash dump (`.dump`) from an
   XM firmware `.bin` package for offline recovery work. Dumps can include a
   crypto blob at a chosen offset (default `0x2FC00`) or immediately before a

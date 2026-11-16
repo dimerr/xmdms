@@ -91,6 +91,9 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QStyle,
     QStyleOptionButton,
+    QStyleOptionProgressBar,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
     QTableView,
     QTableWidget,
     QTextBrowser,
@@ -103,6 +106,57 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+_REAL_HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def _private_dirs():
+    """Directories private files may live in, most specific first.
+
+    Resolve symlinks so a desktop shortcut that links to the real executable
+    still finds files beside the real application, not beside the shortcut.
+    """
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe = os.path.abspath(sys.executable)
+        candidates.extend((os.path.realpath(exe), exe))
+        candidates.append(getattr(sys, "_MEIPASS", ""))
+    candidates.extend((os.path.realpath(__file__), __file__))
+    result = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = (candidate if os.path.isdir(candidate)
+                else os.path.dirname(candidate))
+        path = os.path.abspath(path)
+        for value in (path, os.path.realpath(path)):
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+PRIVATE_DIRS = _private_dirs()
+APP_DIR = PRIVATE_DIRS[0] if PRIVATE_DIRS else (
+    os.path.dirname(os.path.abspath(sys.executable))
+    if getattr(sys, "frozen", False) else HERE)
+# Private modules next to the real executable/script win; bundled locations
+# remain as fallbacks for PyInstaller's one-dir layout.
+for _module_dir in reversed(PRIVATE_DIRS):
+    if _module_dir not in sys.path:
+        sys.path.insert(0, _module_dir)
+
+
+def application_file(name):
+    """Locate a private file next to the real executable or script."""
+    for base in PRIVATE_DIRS:
+        candidate = os.path.join(base, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
 from i18n import (
     load_language,
     resolve_language,
@@ -110,9 +164,7 @@ from i18n import (
     tr,
 )
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+
 
 GITHUB_REPO = "dimerr/xmdms"
 GITHUB_PROFILE = "https://github.com/dimerr"
@@ -217,6 +269,7 @@ IP_SET_REQ = 1532
 IP_SET_RSP = 1533
 PROBE_INTERVAL = 1.0
 SET_TIMEOUT = 3.0
+MAX_PARALLEL_UPLOADS = 4
 CONNECTED_BRUSH = QBrush(QColor("#A5D6A7"))
 PROVISION_OK_BRUSH = QBrush(QColor("#A5D6A7"))
 PROVISION_FAILED_BRUSH = QBrush(QColor("#EF9A9A"))
@@ -365,6 +418,7 @@ CAMERA_FIELD_PATHS = {
 }
 CAMERA_EX_FIELD_PATHS = {
     "AutomaticAdjustment": (None, "AutomaticAdjustment"),
+    "DayNightSwitch": ("DayNightSwitch", "SwitchMode"),
     "Style": (None, "Style"),
     "DWDR": ("BroadTrends", "AutoGain"),
     "DWDRGain": ("BroadTrends", "Gain"),
@@ -636,8 +690,15 @@ _cloud_patch = None
 
 
 def _import_cloud_patch():
-    path = os.path.join(HERE, CLOUD_PATCH_FILES[0])
-    if not os.path.isfile(path):
+    override = str(os.environ.get("XM_CLOUD_PATCH") or "").strip()
+    if override:
+        override = os.path.expanduser(override)
+        if not os.path.isabs(override):
+            override = os.path.join(APP_DIR, override)
+        path = os.path.abspath(override)
+    else:
+        path = application_file(CLOUD_PATCH_FILES[0])
+    if not path or not os.path.isfile(path):
         raise RuntimeError(
             "xmcloud.py was not found next to the application — cloud/RPS "
             "support is not available.")
@@ -650,7 +711,13 @@ def _import_cloud_patch():
 
 def cloud_patch_available():
     """True when xmcloud.py sits next to the application."""
-    return os.path.isfile(os.path.join(HERE, CLOUD_PATCH_FILES[0]))
+    override = str(os.environ.get("XM_CLOUD_PATCH") or "").strip()
+    if override:
+        override = os.path.expanduser(override)
+        if not os.path.isabs(override):
+            override = os.path.join(APP_DIR, override)
+        return os.path.isfile(os.path.abspath(override))
+    return bool(application_file(CLOUD_PATCH_FILES[0]))
 
 
 def _cloud_dispatch(original, patched):
@@ -705,21 +772,12 @@ def load_private_extension(window):
     gitignored and local-only.  ``priv.py`` must define
     ``install(window, app)`` where ``app`` is this running module.
     """
-    bases = []
-    try:
-        bases.append(window._app_dir())
-    except Exception:
-        pass
-    if HERE not in bases:
-        bases.append(HERE)
-    path = ""
-    for base in bases:
-        candidate = os.path.join(base, "priv.py")
-        if os.path.isfile(candidate):
-            path = candidate
-            break
+    path = application_file("priv.py")
     if not path:
         return
+    private_dir = os.path.dirname(path)
+    if private_dir and private_dir not in sys.path:
+        sys.path.insert(0, private_dir)
     try:
         spec = importlib.util.spec_from_file_location("xmdms_priv", path)
         if spec is None or spec.loader is None:
@@ -1723,6 +1781,23 @@ class NetipThread(QThread):
             except Exception:
                 pass
 
+    @staticmethod
+    def _camera_config_value(camera, command, list_command=None):
+        try:
+            value = camera.get_command(command, 1042)
+        except Exception:
+            value = None
+        if not (isinstance(value, dict) and "Ret" not in value):
+            if list_command:
+                try:
+                    reply = camera.get_command(list_command, 1042)
+                except Exception:
+                    reply = None
+                if (isinstance(reply, list) and reply
+                        and isinstance(reply[0], dict)):
+                    value = reply[0]
+        return value
+
     def run(self):
         if DVRIPCam is None:
             self.failed.emit("python-dvr (dvrip.py) is not available")
@@ -1891,6 +1966,11 @@ class NetipThread(QThread):
                                         "AVEnc.SmartH264.[%d]" % chn, 1042)})
                             else:
                                 encode_smart.append(None)
+                    def has_valid(values):
+                        return any(
+                            isinstance(item, dict) and "Ret" not in item
+                            for item in values)
+
                     if not dig_channels:
                         if want("encode_ability"):
                             try:
@@ -1901,24 +1981,6 @@ class NetipThread(QThread):
                                     encode_ability = [reply]
                             except Exception:
                                 encode_ability = []
-                        if want("camera_param"):
-                            try:
-                                camera_param = [camera.get_command(
-                                    "Camera.Param.[0]", 1042)]
-                            except Exception:
-                                camera_param = [None]
-                        if want("camera_ex_param"):
-                            try:
-                                camera_ex_param = [camera.get_command(
-                                    "Camera.ParamEx.[0]", 1042)]
-                            except Exception:
-                                camera_ex_param = [None]
-                        if want("white_light"):
-                            try:
-                                white_light = [camera.get_command(
-                                    "Camera.WhiteLight", 1042)]
-                            except Exception:
-                                white_light = [None]
                         if want("encode_smart"):
                             has_v2 = bool(smart_v2) and smart_v2[0] == 1
                             has_v1 = bool(smart_v1) and smart_v1[0] == 1
@@ -1934,6 +1996,33 @@ class NetipThread(QThread):
                                         "AVEnc.SmartH264.[0]", 1042)})
                             else:
                                 encode_smart.append(None)
+
+                    # Some direct IP cameras report DigChannel=1 but do not
+                    # implement NetWork.ChnStatus, leaving camera_param as
+                    # [None].  Fall back to channel 0 whenever no usable
+                    # camera config was returned.
+                    if want("camera_param") and not has_valid(camera_param):
+                        value = self._camera_config_value(
+                            camera, "Camera.Param.[0]", "Camera.Param")
+                        if camera_param:
+                            camera_param[0] = value
+                        else:
+                            camera_param.append(value)
+                    if want("camera_ex_param") and not has_valid(camera_ex_param):
+                        value = self._camera_config_value(
+                            camera, "Camera.ParamEx.[0]", "Camera.ParamEx")
+                        if camera_ex_param:
+                            camera_ex_param[0] = value
+                        else:
+                            camera_ex_param.append(value)
+                    if want("white_light") and not has_valid(white_light):
+                        value = self._camera_config_value(
+                            camera, "Camera.WhiteLight")
+                        if white_light:
+                            white_light[0] = value
+                        else:
+                            white_light.append(value)
+
                     if want("encode_channels"):
                         payload["encode_channels"] = encode_channels
                     if want("encode_smart"):
@@ -2375,7 +2464,10 @@ class NetipThread(QThread):
                 "Ability.FunctionEnable", ability, 1040)
         encode_channels = changes.get("encode_channels")
         if encode_channels:
-            for chn, entry in encode_channels:
+            total = len(encode_channels)
+            for index, (chn, entry) in enumerate(encode_channels, 1):
+                self.progress.emit("Applying encode channel %d (%d/%d)" % (
+                    chn + 1, index, total))
                 command = "NetUse.DigitalEncode.[%d]" % chn
                 results[command] = camera.set_command(command, entry, 1040)
         encode_smart = changes.get("encode_smart")
@@ -2392,17 +2484,26 @@ class NetipThread(QThread):
                 "Simplify.Encode", av_encode, 1040)
         camera_param = changes.get("camera_param")
         if camera_param:
-            for chn, config in camera_param:
+            total = len(camera_param)
+            for index, (chn, config) in enumerate(camera_param, 1):
+                self.progress.emit("Applying camera channel %d (%d/%d)" % (
+                    chn + 1, index, total))
                 command = "Camera.Param.[%d]" % chn
                 results[command] = camera.set_command(command, config, 1040)
         camera_ex_param = changes.get("camera_ex_param")
         if camera_ex_param:
-            for chn, config in camera_ex_param:
+            total = len(camera_ex_param)
+            for index, (chn, config) in enumerate(camera_ex_param, 1):
+                self.progress.emit("Applying camera extras %d (%d/%d)" % (
+                    chn + 1, index, total))
                 command = "Camera.ParamEx.[%d]" % chn
                 results[command] = camera.set_command(command, config, 1040)
         white_light = changes.get("white_light")
         if white_light:
-            for command, config in white_light:
+            total = len(white_light)
+            for index, (command, config) in enumerate(white_light, 1):
+                self.progress.emit("Applying white light %d/%d" % (
+                    index, total))
                 results[command] = camera.set_command(command, config, 1040)
         for key, command in (("uart_comm", "Uart.Comm"), ("uart_ptz", "Uart.PTZ"),
                              ("uart_rs485", "Uart.RS485")):
@@ -3193,6 +3294,7 @@ class ReleaseCheckThread(QThread):
 
 class DeviceTableModel(QAbstractTableModel):
     SORT_ROLE = Qt.ItemDataRole.UserRole + 1
+    PROGRESS_ROLE = Qt.ItemDataRole.UserRole + 2
     check_state_changed = Signal(object)
     COLUMNS = (
         ("", "check"),
@@ -3216,6 +3318,7 @@ class DeviceTableModel(QAbstractTableModel):
         self._checked = set()
         self._connected = set()
         self._provision = {}
+        self._progress = {}
         self._sort_column = 2
         self._sort_order = Qt.SortOrder.AscendingOrder
 
@@ -3252,6 +3355,8 @@ class DeviceTableModel(QAbstractTableModel):
         if not index.isValid():
             return None
         device = self._devices[index.row()]
+        if role == self.PROGRESS_ROLE:
+            return self._progress.get(self.identity(device))
         if role == Qt.ItemDataRole.BackgroundRole:
             identity = self.identity(device)
             state = self._provision.get(identity)
@@ -3291,6 +3396,8 @@ class DeviceTableModel(QAbstractTableModel):
     def _sort_key(self, key, value):
         if key in ("ip", "gateway", "subnet"):
             return ip_sort_key(value or "")
+        if key == "version":
+            return version_key(value)
         if key.endswith("_port"):
             try:
                 return int(value)
@@ -3364,6 +3471,26 @@ class DeviceTableModel(QAbstractTableModel):
             return Qt.CheckState.Checked
         return Qt.CheckState.PartiallyChecked
 
+    def row_checked(self, row):
+        if not 0 <= row < len(self._devices):
+            return False
+        return self.identity(self._devices[row]) in self._checked
+
+    def set_rows_checked(self, rows, checked):
+        rows = [row for row in rows if 0 <= row < len(self._devices)]
+        if not rows:
+            return
+        for row in rows:
+            identity = self.identity(self._devices[row])
+            if checked:
+                self._checked.add(identity)
+            else:
+                self._checked.discard(identity)
+        self.dataChanged.emit(
+            self.index(min(rows), 0), self.index(max(rows), 0),
+            [Qt.ItemDataRole.CheckStateRole])
+        self.check_state_changed.emit(self.checked_state())
+
     def set_all_checked(self, checked):
         if checked:
             self._checked = {self.identity(device) for device in self._devices}
@@ -3385,6 +3512,7 @@ class DeviceTableModel(QAbstractTableModel):
         self._checked.discard(self.identity(device))
         self._connected.discard(self.identity(device))
         self._provision.pop(self.identity(device), None)
+        self._progress.pop(self.identity(device), None)
         self._rows = {
             self.identity(item): index
             for index, item in enumerate(self._devices)
@@ -3399,6 +3527,7 @@ class DeviceTableModel(QAbstractTableModel):
         self._checked = set()
         self._connected = set()
         self._provision = {}
+        self._progress = {}
         self.endResetModel()
         self.check_state_changed.emit(self.checked_state())
 
@@ -3430,6 +3559,8 @@ class DeviceTableModel(QAbstractTableModel):
                     store.add(new_identity)
             if old_identity in self._provision:
                 self._provision[new_identity] = self._provision.pop(old_identity)
+            if old_identity in self._progress:
+                self._progress[new_identity] = self._progress.pop(old_identity)
             if row is not None:
                 self._rows[new_identity] = row
         self._resort()
@@ -3445,6 +3576,29 @@ class DeviceTableModel(QAbstractTableModel):
             self.dataChanged.emit(
                 self.index(row, 0), self.index(row, len(self.COLUMNS) - 1))
 
+    def set_progress(self, identity, value):
+        if value is None:
+            if identity not in self._progress:
+                return
+            self._progress.pop(identity, None)
+        else:
+            value = max(0, min(100, int(value)))
+            if self._progress.get(identity) == value:
+                return
+            self._progress[identity] = value
+        row = self._rows.get(identity)
+        if row is None:
+            return
+        column = next(
+            (index for index, (_title, key) in enumerate(self.COLUMNS)
+             if key == "host_name"), len(self.COLUMNS) - 1)
+        self.dataChanged.emit(
+            self.index(row, column), self.index(row, column),
+            [self.PROGRESS_ROLE])
+
+    def clear_progress(self, identity):
+        self.set_progress(identity, None)
+
     def clear_provision_states(self):
         if not self._provision:
             return
@@ -3453,6 +3607,34 @@ class DeviceTableModel(QAbstractTableModel):
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(len(self._devices) - 1, len(self.COLUMNS) - 1))
+
+
+class DeviceProgressDelegate(QStyledItemDelegate):
+    """Draw a progress bar in the Host Name column during firmware upload."""
+
+    def paint(self, painter, option, index):
+        value = index.data(DeviceTableModel.PROGRESS_ROLE)
+        if value is None:
+            super().paint(painter, option, index)
+            return
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        base = QStyleOptionViewItem(option)
+        self.initStyleOption(base, index)
+        base.text = ""
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, base, painter, widget)
+        bar = QStyleOptionProgressBar()
+        bar.rect = option.rect.adjusted(2, 3, -2, -3)
+        bar.minimum = 0
+        bar.maximum = 100
+        bar.progress = max(0, min(100, int(value)))
+        bar.text = "%d%%" % bar.progress
+        bar.textVisible = True
+        bar.textAlignment = Qt.AlignmentFlag.AlignCenter
+        bar.state = QStyle.StateFlag.State_Enabled
+        style.drawControl(
+            QStyle.ControlElement.CE_ProgressBar, bar, painter, widget)
 
 
 class IpAddressEdit(QWidget):
@@ -3869,6 +4051,7 @@ class EncodeTableDialog(QDialog):
         self.setWindowTitle("Encode — all channels")
         self._window = window
         self._rows = {}
+        self._initial = {}
         self.resize(1060, 560)
 
         table = QTableWidget(0, len(self.COLUMNS))
@@ -3953,6 +4136,8 @@ class EncodeTableDialog(QDialog):
                         fields[key].setCurrentText(value)
             for widget in fields.values():
                 widget.setEnabled(enabled)
+            self._initial[chn] = {
+                key: self._widget_value(fields[key]) for key in self.KEYS}
 
         footer = QTableWidget(2, len(self.KEYS))
         footer.horizontalHeader().setVisible(False)
@@ -4061,64 +4246,470 @@ class EncodeTableDialog(QDialog):
             else:
                 widget.setValue(editor.value())
 
+    @staticmethod
+    def _widget_value(widget):
+        if isinstance(widget, QComboBox):
+            return widget.currentText().strip()
+        return widget.value()
+
+    def _changed(self, chn, keys):
+        fields = self._rows[chn]
+        initial = self._initial.get(chn, {})
+        return any(
+            fields[key].isEnabled()
+            and self._widget_value(fields[key]) != initial.get(key)
+            for key in keys)
+
     def _apply(self):
         window = self._window
+        channels = []
+        smart_changes = []
+        video_keys = ("m_res", "m_fps", "m_rc", "m_quality", "m_gop",
+                      "s_res", "s_fps", "s_rc", "s_quality", "s_gop")
+        smart_keys = ("m_smart", "s_smart")
         for chn, fields in self._rows.items():
             entry = window._encode_entry(chn)
             if not isinstance(entry, dict):
                 continue
-            for prefix, format_key in (("m", "MainFormat"), ("s", "ExtraFormat")):
-                fmt = entry.setdefault(format_key, {})
-                if not isinstance(fmt, dict):
-                    fmt = {}
-                    entry[format_key] = fmt
-                video = fmt.setdefault("Video", {})
-                video["Resolution"] = fields[prefix + "_res"].currentText().strip()
-                video["FPS"] = fields[prefix + "_fps"].value()
-                video["BitRateControl"] = fields[prefix + "_rc"].currentText().strip()
-                video["Quality"] = fields[prefix + "_quality"].value()
-                video["GOP"] = fields[prefix + "_gop"].value()
-                if video["BitRateControl"].upper() == "VBR":
-                    bitrate = encode_vbr_bitrate(
-                        video["Resolution"], video.get("Compression"),
-                        video["Quality"], video["FPS"], video["GOP"],
-                        window._encode_max_fps)
-                    if bitrate:
-                        video["BitRate"] = bitrate
-            smart_state = window._encode_smart_state(chn)
-            if isinstance(smart_state, dict):
-                config = smart_state.get("config")
-                if isinstance(config, dict):
-                    for index, key in ((0, "m_smart"), (1, "s_smart")):
-                        value = fields[key].currentText()
-                        if smart_state.get("mode") == "v2":
-                            plus = config.setdefault("Smart264PlusV2", [])
-                            v2 = config.setdefault("Smart264V2", [])
-                            while len(plus) <= index:
-                                plus.append({})
-                            while len(v2) <= index:
-                                v2.append({})
-                            if isinstance(plus[index], dict):
-                                plus[index]["SmartH264Plus"] = (
-                                    1 if value == "H265AI" else 0)
-                            if isinstance(v2[index], dict):
-                                v2[index]["SmartH264"] = value == "H265+"
-                        elif smart_state.get("mode") == "v1" and index == 0:
-                            config["SmartH264"] = value != "Off"
-        channels = []
-        for chn, config in enumerate(window._encode_configs):
-            if isinstance(config, list) and config and isinstance(config[0], dict):
-                channels.append((chn, config))
-        if not channels:
-            window._message("Nothing to apply.")
+            if self._changed(chn, video_keys):
+                for prefix, format_key in (("m", "MainFormat"),
+                                           ("s", "ExtraFormat")):
+                    fmt = entry.setdefault(format_key, {})
+                    if not isinstance(fmt, dict):
+                        fmt = {}
+                        entry[format_key] = fmt
+                    video = fmt.setdefault("Video", {})
+                    video["Resolution"] = fields[
+                        prefix + "_res"].currentText().strip()
+                    video["FPS"] = fields[prefix + "_fps"].value()
+                    video["BitRateControl"] = fields[
+                        prefix + "_rc"].currentText().strip()
+                    video["Quality"] = fields[prefix + "_quality"].value()
+                    video["GOP"] = fields[prefix + "_gop"].value()
+                    if video["BitRateControl"].upper() == "VBR":
+                        bitrate = encode_vbr_bitrate(
+                            video["Resolution"], video.get("Compression"),
+                            video["Quality"], video["FPS"], video["GOP"],
+                            window._encode_max_fps)
+                        if bitrate:
+                            video["BitRate"] = bitrate
+                channels.append((chn, window._encode_configs[chn]))
+            if self._changed(chn, smart_keys):
+                smart_state = window._encode_smart_state(chn)
+                if isinstance(smart_state, dict):
+                    config = smart_state.get("config")
+                    if isinstance(config, dict):
+                        mode = smart_state.get("mode")
+                        for index, key in ((0, "m_smart"), (1, "s_smart")):
+                            value = fields[key].currentText()
+                            if mode == "v2":
+                                plus = config.setdefault("Smart264PlusV2", [])
+                                v2 = config.setdefault("Smart264V2", [])
+                                while len(plus) <= index:
+                                    plus.append({})
+                                while len(v2) <= index:
+                                    v2.append({})
+                                if isinstance(plus[index], dict):
+                                    plus[index]["SmartH264Plus"] = (
+                                        1 if value == "H265AI" else 0)
+                                if isinstance(v2[index], dict):
+                                    v2[index]["SmartH264"] = value == "H265+"
+                            elif mode == "v1" and index == 0:
+                                config["SmartH264"] = value != "Off"
+                        if mode in ("v1", "v2"):
+                            smart_changes.append((chn, mode, config))
+        if not channels and not smart_changes:
+            window._message("No encode settings changed.")
             return
+        changes = {}
+        if channels:
+            changes["encode_channels"] = channels
+        if smart_changes:
+            changes["encode_smart"] = smart_changes
         for key in ("encode_channels", "encode_smart", "encode_ability", "av_encode"):
             window._fetched_keys.discard(key)
         window._start_system_action(
-            "apply",
-            changes={"encode_channels": channels,
-                     "encode_smart": window._encode_smart_changes()},
-            label="Applying encode settings on")
+            "apply", changes=changes, label="Applying encode settings on")
+        self.accept()
+
+
+class CameraTableDialog(QDialog):
+    """Mass view/edit of camera settings for all channels."""
+
+    COLUMNS = ("Day/Night", "DN switch", "White light", "Shutter", "Gain",
+               "Day NF", "Night NF", "DNC threshold", "Style", "DWDR",
+               "DWDR gain")
+    KEYS = ("daynight", "dn_switch", "white_mode", "shutter", "gain",
+            "day_nf", "night_nf", "dnc", "style", "dwdr", "dwdr_gain")
+    DAY_NIGHT_OPTIONS = (
+        ("Starlight", 0), ("Color", 1), ("B&W", 2), ("HumanSense", 3),
+        ("ColorSense", 4), ("SmartExir", 5), ("LicensePlate", 6))
+    WHITE_MODE_OPTIONS = (
+        ("Steady Mode", "KeepOpen"), ("Auto Mode", "Auto"),
+        ("Timer Mode", "Timing"), ("Smart Mode", "Intelligent"),
+        ("Atmosphere Light", "Atmosphere"), ("Music Mode", "Glint"),
+        ("Off", "Close"))
+    SHUTTER_OPTIONS = (("None", 0), ("Low", 1), ("Mid", 2), ("High", 3))
+    DN_SWITCH_OPTIONS = (("Auto change", 0), ("Day mode", 1),
+                         ("Night mode", 2), ("Clock mode", 3))
+    STYLE_OPTIONS = (
+        ("Style 1", "typedefault"), ("Style 2", "style1"),
+        ("Style 3", "style2"))
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Camera — all channels")
+        self._window = window
+        self._rows = {}
+        self._all = {}
+        self._initial = {}
+        self.resize(1120, 560)
+
+        table = QTableWidget(0, len(self.COLUMNS))
+        table.setHorizontalHeaderLabels(self.COLUMNS)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(True)
+        table.setSortingEnabled(False)
+        install_copy_menu(table)
+        self.table = table
+
+        channels = max(
+            len(window._camera_configs),
+            len(window._camera_ex_configs),
+            len(window._white_light_configs))
+        table.setRowCount(channels)
+        for chn in range(channels):
+            table.setVerticalHeaderItem(
+                chn, QTableWidgetItem("CAM%02d" % (chn + 1)))
+            camera = window._camera_param(chn)
+            ex = window._camera_ex_param(chn)
+            white = window._white_light_param(chn)
+            fields = {}
+            fields["daynight"] = self._combo(self.DAY_NIGHT_OPTIONS)
+            fields["daynight"].setToolTip(
+                "Day/Night switch Day or Night mode overrides this setting.")
+            fields["dn_switch"] = self._combo(self.DN_SWITCH_OPTIONS)
+            fields["white_mode"] = self._combo(self.WHITE_MODE_OPTIONS)
+            fields["shutter"] = self._combo(self.SHUTTER_OPTIONS)
+            fields["gain"] = self._spin(0, 100)
+            fields["day_nf"] = self._spin(0, 5)
+            fields["night_nf"] = self._spin(0, 5)
+            fields["dnc"] = self._spin(0, 100)
+            fields["style"] = self._combo(self.STYLE_OPTIONS)
+            fields["dwdr"] = QCheckBox()
+            fields["dwdr_gain"] = self._spin(0, 100)
+
+            if isinstance(camera, dict):
+                fields["daynight"].setEnabled(self._set_combo(
+                    fields["daynight"],
+                    window._field_read(
+                        camera, "DayNightColor", CAMERA_FIELD_PATHS)))
+                fields["shutter"].setEnabled(self._set_combo(
+                    fields["shutter"],
+                    window._field_read(
+                        camera, "EsShutter", CAMERA_FIELD_PATHS)))
+                fields["gain"].setEnabled(self._set_spin(
+                    fields["gain"],
+                    window._field_read(camera, "Gain", CAMERA_FIELD_PATHS)))
+                fields["day_nf"].setEnabled(self._set_spin(
+                    fields["day_nf"],
+                    window._field_read(
+                        camera, "Day_nfLevel", CAMERA_FIELD_PATHS)))
+                fields["night_nf"].setEnabled(self._set_spin(
+                    fields["night_nf"],
+                    window._field_read(
+                        camera, "Night_nfLevel", CAMERA_FIELD_PATHS)))
+                fields["dnc"].setEnabled(self._set_spin(
+                    fields["dnc"],
+                    window._field_read(camera, "DncThr", CAMERA_FIELD_PATHS)))
+            else:
+                for key in ("daynight", "shutter", "gain", "day_nf",
+                            "night_nf", "dnc"):
+                    fields[key].setEnabled(False)
+
+            if isinstance(white, dict):
+                fields["white_mode"].setEnabled(self._set_combo(
+                    fields["white_mode"],
+                    window._field_read(
+                        white, "WorkMode", WHITE_LIGHT_FIELD_PATHS)))
+            else:
+                fields["white_mode"].setEnabled(False)
+
+            if isinstance(ex, dict):
+                fields["dn_switch"].setEnabled(self._set_combo(
+                    fields["dn_switch"],
+                    window._field_read(
+                        ex, "DayNightSwitch", CAMERA_EX_FIELD_PATHS)))
+                fields["style"].setEnabled(self._set_combo(
+                    fields["style"],
+                    window._field_read(ex, "Style", CAMERA_EX_FIELD_PATHS)))
+                fields["dwdr"].setEnabled(self._set_check(
+                    fields["dwdr"],
+                    window._field_read(ex, "DWDR", CAMERA_EX_FIELD_PATHS)))
+                fields["dwdr_gain"].setEnabled(self._set_spin(
+                    fields["dwdr_gain"],
+                    window._field_read(
+                        ex, "DWDRGain", CAMERA_EX_FIELD_PATHS)))
+            else:
+                for key in ("dn_switch", "style", "dwdr", "dwdr_gain"):
+                    fields[key].setEnabled(False)
+
+            for column, key in enumerate(self.KEYS):
+                table.setCellWidget(chn, column, fields[key])
+            self._rows[chn] = fields
+            self._initial[chn] = {
+                key: self._widget_value(fields[key]) for key in self.KEYS}
+
+        footer = QTableWidget(2, len(self.KEYS))
+        footer.horizontalHeader().setVisible(False)
+        footer.verticalHeader().setVisible(True)
+        footer.setVerticalHeaderItem(0, QTableWidgetItem(""))
+        footer.setVerticalHeaderItem(1, QTableWidgetItem(""))
+        footer.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        footer.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        footer.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        footer.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        footer.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        footer.verticalHeader().setDefaultSectionSize(30)
+        self.footer = footer
+        for column, key in enumerate(self.KEYS):
+            if key == "daynight":
+                editor = self._combo(self.DAY_NIGHT_OPTIONS)
+            elif key == "dn_switch":
+                editor = self._combo(self.DN_SWITCH_OPTIONS)
+            elif key == "white_mode":
+                editor = self._combo(self.WHITE_MODE_OPTIONS)
+            elif key == "shutter":
+                editor = self._combo(self.SHUTTER_OPTIONS)
+            elif key == "style":
+                editor = self._combo(self.STYLE_OPTIONS)
+            elif key == "dwdr":
+                editor = self._combo((("Off", 0), ("On", 1)))
+            else:
+                editor = self._spin(
+                    0, 5 if key in ("day_nf", "night_nf") else 100)
+            self._all[key] = editor
+            footer.setCellWidget(0, column, editor)
+            button = QPushButton("To all")
+            button.clicked.connect(
+                lambda _=False, name=key: self._apply_all(name))
+            footer.setCellWidget(1, column, button)
+        table.resizeColumnsToContents()
+        dwdr_column = self.KEYS.index("dwdr")
+        table.setColumnWidth(
+            dwdr_column, max(table.columnWidth(dwdr_column), 70))
+
+        header = table.horizontalHeader()
+
+        def sync_footer(*_):
+            try:
+                footer.verticalHeader().setFixedWidth(
+                    table.verticalHeader().width())
+                for column in range(len(self.KEYS)):
+                    footer.setColumnWidth(column, header.sectionSize(column))
+                footer.setFixedHeight(
+                    footer.rowHeight(0) + footer.rowHeight(1)
+                    + 2 * footer.frameWidth())
+            except RuntimeError:
+                return
+
+        self._sync_footer = sync_footer
+        header.sectionResized.connect(sync_footer)
+        table.verticalHeader().geometriesChanged.connect(sync_footer)
+        sync_footer()
+
+        apply_button = QPushButton("Apply")
+        apply_button.clicked.connect(self._apply)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(apply_button)
+        buttons.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(table, 1)
+        layout.addWidget(footer)
+        layout.addLayout(buttons)
+
+    @staticmethod
+    def _combo(options):
+        combo = QComboBox()
+        for text, value in options:
+            combo.addItem(text, value)
+        return combo
+
+    @staticmethod
+    def _spin(minimum, maximum):
+        spin = QSpinBox()
+        spin.setRange(minimum, maximum)
+        return spin
+
+    @staticmethod
+    def _widget_value(widget):
+        if isinstance(widget, QCheckBox):
+            return bool(widget.isChecked())
+        if isinstance(widget, QComboBox):
+            return widget.currentData()
+        return widget.value()
+
+    @staticmethod
+    def _number(value):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value), 0)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _set_combo(cls, combo, value):
+        if value is None:
+            combo.setCurrentIndex(-1)
+            return False
+        index = combo.findData(value)
+        if index < 0:
+            number = cls._number(value)
+            if number is not None:
+                index = combo.findData(number)
+            if index < 0:
+                combo.addItem(str(value), value)
+                index = combo.count() - 1
+        combo.setCurrentIndex(index)
+        return True
+
+    @classmethod
+    def _set_spin(cls, spin, value):
+        number = cls._number(value)
+        if number is None:
+            return False
+        spin.setValue(max(spin.minimum(), min(spin.maximum(), number)))
+        return True
+
+    @classmethod
+    def _set_check(cls, check, value):
+        number = cls._number(value)
+        if number is None:
+            return False
+        check.setChecked(bool(number))
+        return True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_footer()
+
+    def _apply_all(self, name):
+        editor = self._all[name]
+        for fields in self._rows.values():
+            widget = fields[name]
+            if not widget.isEnabled():
+                continue
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(editor.currentData()))
+            elif isinstance(widget, QComboBox):
+                if widget.findData(editor.currentData()) < 0:
+                    widget.addItem(editor.currentText(), editor.currentData())
+                widget.setCurrentIndex(
+                    widget.findData(editor.currentData()))
+            else:
+                widget.setValue(editor.value())
+
+    def _changed(self, chn, keys):
+        fields = self._rows[chn]
+        initial = self._initial.get(chn, {})
+        return any(
+            fields[key].isEnabled()
+            and self._widget_value(fields[key]) != initial.get(key)
+            for key in keys)
+
+    def _apply(self):
+        window = self._window
+        channels = []
+        ex_channels = []
+        white = []
+        changed_sections = {}
+        for chn, fields in self._rows.items():
+            camera = window._camera_param(chn)
+            if isinstance(camera, dict) and self._changed(
+                    chn, ("daynight", "shutter", "gain", "day_nf",
+                          "night_nf", "dnc")):
+                if fields["daynight"].isEnabled():
+                    camera["DayNightColor"] = fields["daynight"].currentData()
+                if fields["shutter"].isEnabled():
+                    camera["EsShutter"] = fields["shutter"].currentData()
+                if fields["gain"].isEnabled():
+                    window._field_write(
+                        camera, "Gain", fields["gain"].value(),
+                        CAMERA_FIELD_PATHS)
+                if fields["day_nf"].isEnabled():
+                    camera["Day_nfLevel"] = fields["day_nf"].value()
+                if fields["night_nf"].isEnabled():
+                    camera["Night_nfLevel"] = fields["night_nf"].value()
+                if fields["dnc"].isEnabled():
+                    camera["DncThr"] = fields["dnc"].value()
+                channels.append((chn, camera))
+                changed_sections.setdefault(chn, set()).add("camera")
+            ex = window._camera_ex_param(chn)
+            if isinstance(ex, dict) and self._changed(
+                    chn, ("dn_switch", "style", "dwdr", "dwdr_gain")):
+                if fields["dn_switch"].isEnabled():
+                    window._field_write(
+                        ex, "DayNightSwitch",
+                        fields["dn_switch"].currentData(),
+                        CAMERA_EX_FIELD_PATHS)
+                if fields["style"].isEnabled():
+                    window._field_write(
+                        ex, "Style", fields["style"].currentData(),
+                        CAMERA_EX_FIELD_PATHS)
+                if fields["dwdr"].isEnabled():
+                    window._field_write(
+                        ex, "DWDR", 1 if fields["dwdr"].isChecked() else 0,
+                        CAMERA_EX_FIELD_PATHS)
+                if fields["dwdr_gain"].isEnabled():
+                    window._field_write(
+                        ex, "DWDRGain", fields["dwdr_gain"].value(),
+                        CAMERA_EX_FIELD_PATHS)
+                ex_channels.append((chn, ex))
+                changed_sections.setdefault(chn, set()).add("ex")
+            white_cfg = window._white_light_param(chn)
+            if (isinstance(white_cfg, dict)
+                    and fields["white_mode"].isEnabled()
+                    and self._changed(chn, ("white_mode",))):
+                white_cfg["WorkMode"] = fields["white_mode"].currentData()
+                command = ("Camera.WhiteLight.[%d]" % chn
+                           if window._camera_indexed else "Camera.WhiteLight")
+                white.append((command, white_cfg))
+                changed_sections.setdefault(chn, set()).add("white")
+        if not (channels or ex_channels or white):
+            window._message("No camera settings changed.")
+            return
+        changes = {}
+        if channels:
+            changes["camera_param"] = channels
+        if ex_channels:
+            changes["camera_ex_param"] = ex_channels
+        if white:
+            changes["white_light"] = white
+        for key in ("camera_param", "camera_ex_param", "white_light"):
+            window._fetched_keys.discard(key)
+        window._start_system_action(
+            "apply", changes=changes, label="Applying camera settings on")
+        window._camera_current = None
+        current = window.camera_channel_combo.currentData()
+        target = min(changed_sections) if changed_sections else current
+        index = window.camera_channel_combo.findData(target)
+        if index >= 0:
+            window.camera_channel_combo.blockSignals(True)
+            window.camera_channel_combo.setCurrentIndex(index)
+            window.camera_channel_combo.blockSignals(False)
+        if target is not None:
+            window._camera_load(target)
         self.accept()
 
 
@@ -9121,11 +9712,20 @@ class MainWindow(QMainWindow):
         self._pass_total = 0
         self._pass_done = 0
         self._pass_failed = 0
+        self._upgrade_threads = []
+        self._upgrade_uploading = set()
+        self._upgrade_queue = []
+        self._upgrade_active = False
+        self._upgrade_total = 0
+        self._upgrade_done = 0
+        self._upgrade_failed = 0
+        self._upgrade_filename = ""
         self._probe_thread = None
         self._release_thread = None
         self._updates_checked = False
         self._about_state = ("idle", None)
         self._netip_thread = None
+        self._netip_queue = deque()
         self._network_thread = None
         self._pending_network = None
         self._network_dhcp_config = []
@@ -9239,10 +9839,18 @@ class MainWindow(QMainWindow):
         self.header = CheckableHeaderView(self.table)
         self.table.setHorizontalHeader(self.header)
         self.table.sortByColumn(2, Qt.SortOrder.AscendingOrder)
+        self.header.setSectionsClickable(True)
         self.header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.header.setStretchLastSection(True)
-        self.header.toggled.connect(self.model.set_all_checked)
-        self.model.check_state_changed.connect(self.header.set_check_state)
+        self._host_name_column = next(
+            (index for index, (_title, key) in enumerate(
+                DeviceTableModel.COLUMNS) if key == "host_name"),
+            len(DeviceTableModel.COLUMNS) - 1)
+        self.table.setItemDelegateForColumn(
+            self._host_name_column, DeviceProgressDelegate(self.table))
+        self.header.toggled.connect(self._set_all_checked_filtered)
+        self.model.check_state_changed.connect(self._update_header_check_state)
+        self.model.check_state_changed.connect(self._update_upgrade_controls)
         metrics = self.table.fontMetrics()
         indicator = self.style().pixelMetric(QStyle.PixelMetric.PM_IndicatorWidth)
         self.header.setMinimumSectionSize(indicator + 10)
@@ -9257,8 +9865,47 @@ class MainWindow(QMainWindow):
         )
         for column, sample in enumerate(measurements, start=1):
             self.table.setColumnWidth(column, metrics.horizontalAdvance(sample) + 16)
+
+        self.filter_edits = {}
+        self.filter_table = QTableWidget(
+            1, len(DeviceTableModel.COLUMNS))
+        self.filter_table.horizontalHeader().setVisible(False)
+        self.filter_table.horizontalHeader().setMinimumSectionSize(1)
+        self.filter_table.verticalHeader().setVisible(False)
+        self.filter_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        self.filter_table.setSelectionMode(
+            QTableWidget.SelectionMode.NoSelection)
+        self.filter_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.filter_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.filter_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.filter_table.setShowGrid(False)
+        self.filter_table.setFrameShape(QFrame.Shape.NoFrame)
+        self.filter_table.setRowHeight(0, 24)
+        self.filter_table.setFixedHeight(24)
+        for column, (title, key) in enumerate(DeviceTableModel.COLUMNS):
+            if not key or key == "check":
+                continue
+            edit = QLineEdit()
+            edit.setClearButtonEnabled(True)
+            # Keep the English source so retranslate_widgets can switch back.
+            edit.setPlaceholderText(title)
+            edit.textChanged.connect(self._apply_table_filter)
+            self.filter_edits[key] = edit
+            self.filter_table.setCellWidget(0, column, edit)
+        self.filter_bar = self.filter_table
+        self.header.sectionResized.connect(self._sync_filter_columns)
+        self.header.geometriesChanged.connect(self._sync_filter_columns)
+        QTimer.singleShot(0, self._sync_filter_columns)
+
         self.table.selectionModel().selectionChanged.connect(self._on_table_selection)
         self.model.layoutChanged.connect(self._on_model_layout_changed)
+        self.model.rowsInserted.connect(lambda *_: self._apply_table_filter())
+        self.model.rowsRemoved.connect(lambda *_: self._apply_table_filter())
+        self.model.modelReset.connect(lambda *_: self._apply_table_filter())
+        self.model.dataChanged.connect(self._on_table_data_changed)
         self.table.doubleClicked.connect(self._connect_device)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_context_menu)
@@ -9309,8 +9956,11 @@ class MainWindow(QMainWindow):
         table_panel = QWidget()
         table_layout = QVBoxLayout(table_panel)
         table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(self.filter_bar)
         table_layout.addWidget(self.table_stack, 1)
         table_layout.addLayout(bottom)
+        self.table_stack.currentChanged.connect(
+            self._table_stack_changed)
 
         self.network_name_edit = QLineEdit()
         self.network_address_edit = IpAddressEdit()
@@ -10117,11 +10767,19 @@ class MainWindow(QMainWindow):
         self._white_light_configs = []
         self._camera_indexed = False
         self._camera_current = None
+        self._camera_last_channel = 0
+        self._camera_dirty = {}
+        self._camera_initial = {}
+        self._camera_initial_chn = None
         camera_grid = QGridLayout()
         camera_grid.setHorizontalSpacing(8)
         camera_grid.setVerticalSpacing(3)
         camera_grid.addWidget(QLabel("Channel:"), 0, 0)
-        camera_grid.addWidget(self.camera_channel_combo, 0, 1, 1, 3)
+        camera_grid.addWidget(self.camera_channel_combo, 0, 1, 1, 2)
+        self.camera_table_button = QPushButton("All channels")
+        self.camera_table_button.clicked.connect(self._open_camera_table)
+        self.camera_table_button.setEnabled(False)
+        camera_grid.addWidget(self.camera_table_button, 0, 3)
         camera_fields = (
             ("Day/Night", "DayNightColor", "combo",
              (("Starlight", 0), ("Color", 1), ("B&W", 2), ("HumanSense", 3),
@@ -10159,6 +10817,8 @@ class MainWindow(QMainWindow):
             self.camera_widgets[key] = widget
             camera_grid.addWidget(QLabel(label + ":"), row, column)
             camera_grid.addWidget(widget, row, column + 1)
+        self.camera_widgets["DayNightColor"].setToolTip(
+            "Day/Night switch Day or Night mode overrides this setting.")
         camera_grid.setColumnStretch(1, 1)
         camera_grid.setColumnStretch(3, 1)
 
@@ -10174,7 +10834,14 @@ class MainWindow(QMainWindow):
             style.addItem(text, value)
         style.setToolTip("Camera.ParamEx.Style")
         self.camera_ex_widgets["Style"] = style
-        camera_grid.addWidget(QLabel("DN switch:"), ex_row, 0)
+        daynight_switch = QComboBox()
+        for text, value in (("Auto change", 0), ("Day mode", 1),
+                            ("Night mode", 2), ("Clock mode", 3)):
+            daynight_switch.addItem(text, value)
+        daynight_switch.setToolTip(
+            "Camera.ParamEx.DayNightSwitch.SwitchMode")
+        self.camera_ex_widgets["DayNightSwitch"] = daynight_switch
+        camera_grid.addWidget(QLabel("DN adjustment:"), ex_row, 0)
         camera_grid.addWidget(automatic, ex_row, 1)
         camera_grid.addWidget(QLabel("Style:"), ex_row, 2)
         camera_grid.addWidget(style, ex_row, 3)
@@ -10197,7 +10864,10 @@ class MainWindow(QMainWindow):
         dwdr_layout.addStretch(1)
         camera_grid.addWidget(QLabel("DWDR:"), dwdr_row, 0)
         camera_grid.addWidget(dwdr_box, dwdr_row, 1, 1, 3)
-        camera_grid.setRowStretch(dwdr_row + 1, 1)
+        switch_row = dwdr_row + 1
+        camera_grid.addWidget(QLabel("Day/Night switch:"), switch_row, 0)
+        camera_grid.addWidget(daynight_switch, switch_row, 1, 1, 3)
+        camera_grid.setRowStretch(switch_row + 1, 1)
 
         image_layout = QHBoxLayout()
         for key, label in (("PictureFlip", "Flip"),
@@ -10547,6 +11217,11 @@ class MainWindow(QMainWindow):
             "_i18n_label_last", tr("Disconnected"))
         self.fetch_label = QLabel("")
         self.fetch_label.setProperty("i18nDynamic", True)
+        self.netip_cancel_button = QPushButton("Cancel")
+        self.netip_cancel_button.setToolTip(
+            "Cancel the current and queued NetIP operations.")
+        self.netip_cancel_button.setVisible(False)
+        self.netip_cancel_button.clicked.connect(self._cancel_system_actions)
         for label in (self.fetch_label, self.status_label, self.video_status_label):
             label.setSizePolicy(
                 QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -10570,6 +11245,7 @@ class MainWindow(QMainWindow):
         status_layout.setContentsMargins(4, 0, 4, 0)
         status_layout.setSpacing(6)
         status_layout.addWidget(self.fetch_label, 4)
+        status_layout.addWidget(self.netip_cancel_button)
         status_layout.addWidget(status_separator())
         status_layout.addWidget(self.middle_stack, 6)
         status_layout.addWidget(status_separator())
@@ -10666,6 +11342,8 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._position_db_handle()
+        if hasattr(self, "filter_table"):
+            QTimer.singleShot(0, self._sync_filter_columns)
 
     def _message(self, text):
         self.fetch_label.setText(tr(text))
@@ -10844,14 +11522,17 @@ class MainWindow(QMainWindow):
         else:
             self.stream_main_radio.setChecked(True)
         username, password = self._device_credentials(device)
+        self._stop_session()
         started = self.video_panel.start(
             device, username, password, stream=stream,
             channel=channel - 1)
         if not started:
+            self._sync_session_monitor()
             return
         self._video_device = device
         self._video_credentials = (username, password)
         self.table_stack.setCurrentWidget(self.video_panel)
+        self._sync_session_monitor()
         self.video_button.setText("STOP VIDEO")
         self.middle_stack.setCurrentWidget(self.video_status_label)
         label = device.get("cloud_id") or device.get("ip") or "device"
@@ -11305,8 +11986,104 @@ class MainWindow(QMainWindow):
             self._fill_broadcast_fields(device)
         self.save_button.setEnabled(True)
 
+    def _table_stack_changed(self, _index):
+        if hasattr(self, "filter_bar"):
+            self.filter_bar.setVisible(
+                self.table_stack.currentWidget() is self.table)
+
+    def _sync_filter_columns(self, *_):
+        # Header sizes can be transient while a layout pass is running, so
+        # read them once the event loop settles instead of in the signal.
+        if not hasattr(self, "filter_table"):
+            return
+        if getattr(self, "_filter_sync_scheduled", False):
+            return
+        self._filter_sync_scheduled = True
+        QTimer.singleShot(0, self._apply_filter_column_widths)
+
+    def _apply_filter_column_widths(self):
+        self._filter_sync_scheduled = False
+        if not hasattr(self, "filter_table"):
+            return
+        for column in range(len(DeviceTableModel.COLUMNS)):
+            self.filter_table.setColumnWidth(
+                column, self.table.columnWidth(column))
+
+    def _filters_active(self):
+        return any(
+            edit.text().strip() for edit in self.filter_edits.values())
+
+    def _filtered_rows(self):
+        return [
+            row for row in range(self.model.rowCount())
+            if not self.table.isRowHidden(row)]
+
+    def _apply_table_filter(self, *_):
+        if not hasattr(self, "filter_edits"):
+            return
+        filters = []
+        for column, (_title, key) in enumerate(DeviceTableModel.COLUMNS):
+            if not key or key == "check":
+                continue
+            edit = self.filter_edits.get(key)
+            if edit is None:
+                continue
+            text = edit.text().strip().lower()
+            if text:
+                filters.append((column, text))
+        table = self.table
+        model = self.model
+        for row in range(model.rowCount()):
+            visible = True
+            for column, text in filters:
+                value = model.index(row, column).data(
+                    Qt.ItemDataRole.DisplayRole)
+                if text not in str(value or "").lower():
+                    visible = False
+                    break
+            table.setRowHidden(row, not visible)
+        current = table.currentIndex()
+        if current.isValid() and table.isRowHidden(current.row()):
+            table.clearSelection()
+            table.setCurrentIndex(QModelIndex())
+        self._update_header_check_state()
+
+    def _update_header_check_state(self, *_):
+        if not hasattr(self, "filter_edits"):
+            return
+        rows = (self._filtered_rows() if self._filters_active()
+                else range(self.model.rowCount()))
+        total = len(rows)
+        checked = sum(
+            1 for row in rows if self.model.row_checked(row))
+        if total == 0 or checked == 0:
+            state = Qt.CheckState.Unchecked
+        elif checked == total:
+            state = Qt.CheckState.Checked
+        else:
+            state = Qt.CheckState.PartiallyChecked
+        self.header.set_check_state(state)
+
+    def _set_all_checked_filtered(self, checked):
+        if self._filters_active():
+            rows = self._filtered_rows()
+        else:
+            rows = range(self.model.rowCount())
+        self.model.set_rows_checked(rows, checked)
+        self._update_header_check_state()
+
+    def _on_table_data_changed(self, _top_left, _bottom_right, roles=()):
+        if roles and all(
+                role in (DeviceTableModel.PROGRESS_ROLE,
+                         Qt.ItemDataRole.BackgroundRole,
+                         Qt.ItemDataRole.CheckStateRole)
+                for role in roles):
+            return
+        self._apply_table_filter()
+
     def _on_model_layout_changed(self):
         QTimer.singleShot(0, self._sync_selection_state)
+        QTimer.singleShot(0, self._apply_table_filter)
 
     def _sync_selection_state(self):
         device = self._selected_device()
@@ -11342,17 +12119,23 @@ class MainWindow(QMainWindow):
         return widgets
 
     def _update_upgrade_controls(self, *_):
-        """Keep the local firmware picker (and Upgrade when connected) usable.
+        """Keep the local firmware picker and Upgrade action usable.
 
-        The Upgrade group is checkable, so Qt disables its children whenever
-        the device reports the online-upgrade feature as disabled; the file
-        edit's internal icon button has to be re-enabled explicitly.
+        A connected device can be upgraded directly.  When disconnected,
+        checked devices can be upgraded as a batch, so the button also needs
+        to follow the table's check state.  Never leave it enabled while an
+        upload is already running.
         """
+        if not hasattr(self, "network_upgrade_file_edit"):
+            return
         self.network_upgrade_file_edit.setEnabled(True)
         for child in self.network_upgrade_file_edit.findChildren(QWidget):
             child.setEnabled(True)
-        if self._connected_identity is not None:
-            self.network_upgrade_button.setEnabled(True)
+        busy = self._upgrade_active or bool(self._upgrade_threads)
+        available = (self._connected_identity is not None
+                     or bool(self.model.checked_devices()))
+        self.network_upgrade_button.setEnabled(
+            available and not busy)
 
     def _enable_device_tabs(self):
         for widget in self._device_tab_widgets():
@@ -11362,6 +12145,7 @@ class MainWindow(QMainWindow):
         self._update_upgrade_controls()
         self._update_channels_button()
         self._update_encode_table_button()
+        self._update_camera_table_button()
 
     def _disable_device_tabs(self):
         for widget in self._device_tab_widgets():
@@ -11566,10 +12350,37 @@ class MainWindow(QMainWindow):
         self.connection_label.setProperty("_i18n_label_last", tr(source))
         self.connection_label.setText(tr(source))
 
+    def _reset_fetched_configs(self):
+        self._system_payload = None
+        self._camera_configs = []
+        self._camera_ex_configs = []
+        self._white_light_configs = []
+        self._camera_current = None
+        self._camera_dirty.clear()
+        self._camera_initial = {}
+        self._camera_initial_chn = None
+        self._encode_configs = []
+        self._encode_smart = []
+        self._encode_ability = []
+        self._encode_av_enc = None
+        self._encode_av_entries = []
+        self._encode_mode = None
+        self._encode_current = None
+        self._encode_channel_names = []
+        for combo in (getattr(self, "camera_channel_combo", None),
+                      getattr(self, "encode_channel_combo", None)):
+            if combo is None:
+                continue
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+
     def _drop_connection(self, message=""):
         identity = self._connected_identity
         if identity is None:
             return
+        self._netip_queue.clear()
+        self._cancel_netip_thread()
         self._stop_session()
         self.model.set_connected(identity, False)
         self._connected_identity = None
@@ -11578,6 +12389,7 @@ class MainWindow(QMainWindow):
         self._fetched_identity = None
         self._fetched_keys = set()
         self._pending_fetch_keys = set()
+        self._reset_fetched_configs()
         self._set_connection_text("Disconnected")
         self._sync_selection_state()
         if message:
@@ -11585,6 +12397,30 @@ class MainWindow(QMainWindow):
 
     def _disconnect_device(self):
         self._drop_connection("Disconnected")
+
+    def _video_active(self):
+        panel = getattr(self, "video_panel", None)
+        return bool(panel is not None and panel.is_active())
+
+    def _sync_session_monitor(self):
+        """Keep the liveness session only when no real operation needs the device.
+
+        Many devices cap concurrent NETIP sessions.  Config fetching, applying
+        settings and video streaming each open their own session, so leaving a
+        keepalive session open as well can make the device kick one of them.
+        """
+        if self._connected_identity is None:
+            self._stop_session()
+            return
+        if self._netip_thread is not None or self._video_active():
+            self._stop_session()
+            return
+        thread = self._session_thread
+        if thread is not None and thread.isRunning():
+            return
+        device = self._device_by_identity(self._connected_identity)
+        if isinstance(device, dict):
+            self._start_session(device)
 
     def _start_session(self, device):
         """Keep a real NETIP socket open so a dropped connection is noticed."""
@@ -11613,20 +12449,25 @@ class MainWindow(QMainWindow):
                 thread.finished.connect(thread.deleteLater)
 
     def _on_session_lost(self, text):
+        self._session_thread = None
         if self._connected_identity is None:
+            return
+        if self._video_active() or self._netip_thread is not None:
+            # Another session is still doing useful work.  Let it report its
+            # own failure instead of declaring the whole device lost here.
             return
         device = self._device_by_identity(self._connected_identity)
         label = (device.get("ip") if isinstance(device, dict) else "") \
             or self._connected_identity
-        if self.video_panel.is_active():
-            self._stop_video()
         self._drop_connection("Connection lost: %s" % label)
 
     def _on_video_lost(self, text):
         if self.video_panel.is_active():
-            self._stop_video()
-        if self._connected_identity is not None:
+            self._stop_video(restart_monitor=False)
+        if self._connected_identity is not None and self._netip_thread is None:
             self._drop_connection("Connection lost")
+        else:
+            self._sync_session_monitor()
 
     def _connect_device(self, index):
         device = self.model.device_at(index.row())
@@ -11645,24 +12486,24 @@ class MainWindow(QMainWindow):
         self._fetched_payload = None
         self._fetched_identity = None
         self._pending_fetch_keys = set()
+        self._netip_queue.clear()
+        self._reset_fetched_configs()
         self.table.selectRow(index.row())
         self.initial_ip_edit.setValue(device.get("ip") or "")
         self._fill_network_fields(device)
         self._connect_pending = identity
-        self._start_session(device)
         label = "Switching to" if previous is not None and previous != identity else "Connecting to"
         keys = sorted(set(self._tab_fetch_keys(self.tabs.currentIndex()))
                       | {"system", "common", "channel_titles"})
         self._start_system_action(
             "fetch", device=device, label=label, changes={"keys": keys})
+        self._sync_session_monitor()
 
     def _tab_fetch_keys(self, index):
-        if not (0 <= index < self.tabs.count()):
-            return []
-        name = self.tabs.tabText(index)
-        for tab_name, keys in TAB_FETCH_KEYS:
-            if tab_name == name:
-                return list(keys)
+        # Tab titles are translated at runtime; match by construction order
+        # instead of the visible English text.
+        if 0 <= index < len(TAB_FETCH_KEYS):
+            return list(TAB_FETCH_KEYS[index][1])
         return []
 
     def _request_fetch(self, keys):
@@ -11702,6 +12543,9 @@ class MainWindow(QMainWindow):
         self._update_upgrade_controls()
 
     def _on_system_progress(self, text):
+        sender = self.sender()
+        if isinstance(sender, NetipThread) and sender is not self._netip_thread:
+            return
         self.fetch_label.setText(tr(text))
 
     @staticmethod
@@ -11916,47 +12760,132 @@ class MainWindow(QMainWindow):
             return
         button.setEnabled(
             self._connected_identity is not None
-            and self._channel_count > 1
-            and self._netip_thread is None)
+            and self._channel_count > 1)
 
-    def _start_system_action(self, action, changes=None, label="", device=None,
-                             on_fetched=None, on_applied=None):
+    def _update_netip_controls(self):
+        button = getattr(self, "netip_cancel_button", None)
+        if button is not None:
+            button.setVisible(
+                self._netip_thread is not None or bool(self._netip_queue))
+
+    def _cancel_system_actions(self):
+        self._netip_queue.clear()
+        self._pending_fetch_keys.clear()
+        self._cancel_netip_thread()
+        self._message("NetIP operation cancelled.")
+        self._sync_session_monitor()
+
+    def _cancel_netip_thread(self):
+        """Stop the current NETIP action without touching queued work."""
+        thread = self._netip_thread
+        self._netip_thread = None
+        self._fetch_in_progress = False
+        self._system_error = False
+        if thread is not None:
+            thread.cancel()
+            self._stale_threads.append(thread)
+        self.fetch_label.setText("")
+        self._set_system_busy(False)
+        self._update_encode_table_button()
+        self._update_camera_table_button()
+        self._update_netip_controls()
+
+    def _queue_system_action(self, job):
+        if job["action"] == "fetch":
+            for existing in self._netip_queue:
+                if (existing["action"] == "fetch"
+                        and existing["identity"] == job["identity"]):
+                    keys = set(existing["changes"].get("keys") or [])
+                    keys.update(job["changes"].get("keys") or [])
+                    existing["changes"]["keys"] = sorted(keys)
+                    return
+        self._netip_queue.append(job)
+
+    def _start_next_system_job(self):
         if self._netip_thread is not None:
-            if action != "fetch":
-                self._message("NetIP operation already running.")
-                return
-            previous = self._netip_thread
-            previous.cancel()
-            self._stale_threads.append(previous)
-            self._netip_thread = None
-        if device is None:
-            device = self._system_target()
-        if not isinstance(device, dict):
-            self._message("No device selected — pick a table row first.")
-            return
-        username, password = self._device_credentials(device)
+            return False
+        while self._netip_queue:
+            job = self._netip_queue.popleft()
+            identity = job.get("identity")
+            connected = self._connected_identity
+            if connected is not None and identity is not None and identity != connected:
+                continue
+            if job["action"] == "fetch" and connected is None:
+                continue
+            self._launch_system_action(job)
+            return True
+        self._update_netip_controls()
+        return False
+
+    def _launch_system_action(self, job):
+        device = job["device"]
         thread = NetipThread(
-            action, device.get("ip") or "",
-            username, password,
+            job["action"], device.get("ip") or "",
+            job["username"], job["password"],
             cloud_id=device.get("cloud_id") or "",
             rps=bool(device.get("rps", True)),
-            changes=changes,
+            changes=job["changes"],
             port=device.get("tcp_port") or 34567,
             parent=self,
             no_md5=bool(device.get("no_md5")))
-        thread.fetched.connect(on_fetched or self._on_system_fetched)
-        thread.applied.connect(on_applied or self._on_system_applied)
+        thread._xm_identity = job["identity"]
+        thread.fetched.connect(job["on_fetched"] or self._on_system_fetched)
+        thread.applied.connect(job["on_applied"] or self._on_system_applied)
         thread.failed.connect(lambda text, t=thread: self._on_system_failed(text, t))
         thread.progress.connect(self._on_system_progress)
         thread.connected.connect(
             lambda name, t=thread: self._on_system_connected(name, t))
         thread.finished.connect(lambda t=thread: self._on_system_finished(t))
         self._netip_thread = thread
-        self._fetch_in_progress = action == "fetch"
+        self._fetch_in_progress = job["action"] == "fetch"
         self._system_error = False
         self._set_system_busy(True)
-        self._message("%s %s ..." % (label or action, device.get("ip") or ""))
+        self._update_netip_controls()
+        self._message("%s %s ..." % (
+            job["label"] or job["action"], device.get("ip") or ""))
+        self._sync_session_monitor()
         thread.start()
+
+    def _start_system_action(self, action, changes=None, label="", device=None,
+                             on_fetched=None, on_applied=None):
+        if device is None:
+            device = self._system_target()
+        if not isinstance(device, dict):
+            self._message("No device selected — pick a table row first.")
+            return False
+        identity = DeviceTableModel.identity(device)
+        username, password = self._device_credentials(device)
+        job = {
+            "action": action,
+            "changes": dict(changes or {}),
+            "label": label,
+            "device": dict(device),
+            "identity": identity,
+            "username": username,
+            "password": password,
+            "on_fetched": on_fetched,
+            "on_applied": on_applied,
+        }
+        if self._netip_thread is not None:
+            current = self._netip_thread
+            current_action = getattr(current, "_action", "")
+            current_identity = getattr(current, "_xm_identity", None)
+            if (action == "fetch" and current_action == "fetch"
+                    and current_identity == identity):
+                pending = set(self._pending_fetch_keys)
+                pending.update(job["changes"].get("keys") or [])
+                self._pending_fetch_keys = pending
+                return True
+            if action == "fetch" and current_action == "fetch":
+                self._cancel_netip_thread()
+            else:
+                self._queue_system_action(job)
+                self._update_netip_controls()
+                self._message("%s queued — waiting for the current NetIP operation." % (
+                    label or action))
+                return True
+        self._launch_system_action(job)
+        return True
 
     def _system_apply(self):
         if self._system_payload is None:
@@ -12447,8 +13376,7 @@ class MainWindow(QMainWindow):
         if button is None:
             return
         button.setEnabled(self._connected_identity is not None
-                          and self.encode_channel_combo.count() > 1
-                          and self._netip_thread is None)
+                          and self.encode_channel_combo.count() > 1)
 
     def _open_encode_table(self):
         if not self._encode_configs:
@@ -12505,17 +13433,27 @@ class MainWindow(QMainWindow):
     def _encode_apply(self):
         self._encode_store_current()
         if self._encode_mode == "nvr":
+            chn = self._encode_current
+            config = None
+            if (chn is not None and 0 <= chn < len(self._encode_configs)):
+                config = self._encode_configs[chn]
             channels = []
-            for chn, config in enumerate(self._encode_configs):
-                if isinstance(config, list) and config and isinstance(config[0], dict):
-                    channels.append((chn, config))
-            if not channels:
+            if (isinstance(config, list) and config
+                    and isinstance(config[0], dict)):
+                channels.append((chn, config))
+            smart = [
+                change for change in self._encode_smart_changes()
+                if change[0] == chn]
+            if not channels and not smart:
                 self._message("No encode settings to apply.")
                 return
+            changes = {}
+            if channels:
+                changes["encode_channels"] = channels
+            if smart:
+                changes["encode_smart"] = smart
             self._start_system_action(
-                "apply",
-                changes={"encode_channels": channels,
-                         "encode_smart": self._encode_smart_changes()},
+                "apply", changes=changes,
                 label="Applying encode settings on")
         elif self._encode_mode == "av" and self._encode_av_enc is not None:
             self._start_system_action(
@@ -12546,6 +13484,19 @@ class MainWindow(QMainWindow):
             if isinstance(config, dict) and "Ret" not in config:
                 return config
         return None
+
+    @staticmethod
+    def _widget_value(widget):
+        if isinstance(widget, QCheckBox):
+            return bool(widget.isChecked())
+        if isinstance(widget, QComboBox):
+            return widget.currentData()
+        return widget.value()
+
+    def _field_widget_values(self, widgets):
+        return {
+            key: self._widget_value(widget)
+            for key, widget in widgets.items() if widget.isEnabled()}
 
     @staticmethod
     def _to_int_value(value):
@@ -12593,6 +13544,8 @@ class MainWindow(QMainWindow):
                 continue
             value = self._field_read(param, key, paths)
             if value is None:
+                if isinstance(widget, QComboBox):
+                    widget.setCurrentIndex(-1)
                 widget.setEnabled(False)
                 continue
             if isinstance(widget, QComboBox):
@@ -12640,6 +13593,8 @@ class MainWindow(QMainWindow):
 
     def _camera_load(self, chn):
         self._camera_current = chn
+        if chn is not None and 0 <= chn < len(self._camera_configs):
+            self._camera_last_channel = chn
         self._load_field_widgets(
             self.camera_widgets, self._camera_param(chn), CAMERA_FIELD_PATHS)
         self._load_field_widgets(
@@ -12648,21 +13603,43 @@ class MainWindow(QMainWindow):
         self._load_field_widgets(
             self.white_light_widgets, self._white_light_param(chn),
             WHITE_LIGHT_FIELD_PATHS)
+        self._camera_initial = {
+            "camera": self._field_widget_values(self.camera_widgets),
+            "ex": self._field_widget_values(self.camera_ex_widgets),
+            "white": self._field_widget_values(self.white_light_widgets),
+        }
+        self._camera_initial_chn = chn
 
     def _camera_channel_changed(self, *_):
         self._camera_store_current()
         self._camera_load(self.camera_channel_combo.currentData())
 
     def _camera_store_current(self):
+        chn = self._camera_current
         self._store_field_widgets(
-            self.camera_widgets, self._camera_param(self._camera_current),
+            self.camera_widgets, self._camera_param(chn),
             CAMERA_FIELD_PATHS)
         self._store_field_widgets(
-            self.camera_ex_widgets, self._camera_ex_param(self._camera_current),
+            self.camera_ex_widgets, self._camera_ex_param(chn),
             CAMERA_EX_FIELD_PATHS)
         self._store_field_widgets(
-            self.white_light_widgets, self._white_light_param(self._camera_current),
+            self.white_light_widgets, self._white_light_param(chn),
             WHITE_LIGHT_FIELD_PATHS)
+        if chn is None or chn != self._camera_initial_chn:
+            return
+        dirty = self._camera_dirty.setdefault(chn, set())
+        for section, widgets in (
+                ("camera", self.camera_widgets),
+                ("ex", self.camera_ex_widgets),
+                ("white", self.white_light_widgets)):
+            initial = self._camera_initial.get(section, {})
+            if any(
+                    widget.isEnabled()
+                    and self._widget_value(widget) != initial.get(key)
+                    for key, widget in widgets.items()):
+                dirty.add(section)
+        if not dirty:
+            self._camera_dirty.pop(chn, None)
 
     def _fill_camera_tab(self, payload):
         configs = payload.get("camera_param")
@@ -12673,52 +13650,75 @@ class MainWindow(QMainWindow):
                 ex_configs if isinstance(ex_configs, list) else [])
         lights = payload.get("white_light")
         self._white_light_configs = lights if isinstance(lights, list) else []
-        self._camera_indexed = self._encode_mode == "nvr"
+        self._camera_indexed = (
+            self._encode_mode == "nvr" or len(self._camera_configs) > 1)
         combo = self.camera_channel_combo
         combo.blockSignals(True)
         combo.clear()
         for chn in range(len(self._camera_configs)):
             combo.addItem("CAM%02d" % (chn + 1), chn)
+        def valid(chn):
+            return (0 <= chn < len(self._camera_configs)
+                    and isinstance(self._camera_configs[chn], dict)
+                    and "Ret" not in self._camera_configs[chn])
+
         target = 0
         for chn, config in enumerate(self._camera_configs):
             if isinstance(config, dict) and "Ret" not in config:
                 target = chn
                 break
+        if valid(self._camera_last_channel):
+            target = self._camera_last_channel
         combo.setCurrentIndex(target if self._camera_configs else -1)
         combo.blockSignals(False)
         self._camera_current = None
         self._camera_load(combo.currentData() if self._camera_configs else None)
+        self._update_camera_table_button()
+
+    def _update_camera_table_button(self):
+        button = getattr(self, "camera_table_button", None)
+        if button is None:
+            return
+        button.setEnabled(
+            self._connected_identity is not None
+            and self.camera_channel_combo.count() > 1)
+
+    def _open_camera_table(self):
+        self._camera_store_current()
+        if not self._camera_configs:
+            self._message("No camera settings fetched yet.")
+            return
+        dialog = CameraTableDialog(self, self)
+        dialog.exec()
+
+    def _on_camera_applied(self, results):
+        self._on_system_applied(results)
+        self._camera_dirty.clear()
+        if self._camera_current is not None:
+            self._camera_load(self._camera_current)
 
     def _camera_apply(self):
         self._camera_store_current()
-        channels = []
-        for chn, config in enumerate(self._camera_configs):
-            if isinstance(config, dict) and "Ret" not in config:
-                channels.append((chn, config))
-        ex_channels = []
-        for chn, config in enumerate(self._camera_ex_configs):
-            if isinstance(config, dict) and "Ret" not in config:
-                ex_channels.append((chn, config))
-        if not channels and not ex_channels:
-            self._message("No camera settings to apply.")
-            return
         changes = {}
-        if channels:
-            changes["camera_param"] = channels
-        if ex_channels:
-            changes["camera_ex_param"] = ex_channels
-        white = []
-        for chn, config in enumerate(self._white_light_configs):
-            if isinstance(config, dict) and "Ret" not in config:
-                if self._camera_indexed:
-                    command = "Camera.WhiteLight.[%d]" % chn
-                else:
-                    command = "Camera.WhiteLight"
-                white.append((command, config))
-        if white:
-            changes["white_light"] = white
+        for chn, sections in sorted(self._camera_dirty.items()):
+            camera = self._camera_param(chn)
+            if "camera" in sections and isinstance(camera, dict):
+                changes.setdefault("camera_param", []).append((chn, camera))
+            ex = self._camera_ex_param(chn)
+            if "ex" in sections and isinstance(ex, dict):
+                changes.setdefault("camera_ex_param", []).append((chn, ex))
+            white = self._white_light_param(chn)
+            if "white" in sections and isinstance(white, dict):
+                command = ("Camera.WhiteLight.[%d]" % chn
+                           if self._camera_indexed else "Camera.WhiteLight")
+                changes.setdefault("white_light", []).append(
+                    (command, white))
+        if not changes:
+            self._message("No camera settings changed.")
+            return
         self._start_system_action(
-            "apply", changes=changes, label="Applying camera settings on")
+            "apply", changes=changes, label="Applying camera settings on",
+            on_applied=self._on_camera_applied)
 
     @staticmethod
     def _format_space(value):
@@ -13220,9 +14220,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _app_dir():
         """Folder the app runs from (the PyInstaller onedir folder when frozen)."""
-        if getattr(sys, "frozen", False):
-            return os.path.dirname(os.path.abspath(sys.executable))
-        return HERE
+        return APP_DIR
 
     def add_system_button(self, text, callback, tooltip=""):
         """Append a local/private action below the System tab buttons."""
@@ -13428,11 +14426,6 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
 
     def _request_logs(self, begin, end):
-        if self._netip_thread is not None:
-            if self._logs_dialog is not None:
-                self._logs_dialog.set_error(
-                    tr("NetIP operation already running."))
-            return
         self._logs_pending = True
         self._start_system_action(
             "logs", label="Reading logs from",
@@ -13475,25 +14468,182 @@ class MainWindow(QMainWindow):
             settings.setValue("firmware_dir", os.path.dirname(path))
 
     def _upgrade_firmware(self):
-        device = self._system_target()
-        if not isinstance(device, dict):
-            self._message("No device selected — pick a table row first.")
-            return
         path = self.network_upgrade_file_edit.text().strip()
         if not path:
             self._browse_firmware()
             path = self.network_upgrade_file_edit.text().strip()
         if not path:
             return
+        checked = self.model.checked_devices()
+        if self._connected_identity is None and checked:
+            devices = checked
+        else:
+            device = self._system_target()
+            if not isinstance(device, dict):
+                self._message("Check at least one device first.")
+                return
+            devices = [device]
+        self._upgrade_devices(devices, path)
+
+    def _upgrade_devices(self, devices, path):
+        if self._upgrade_active or self._upgrade_threads:
+            self._message("Firmware upgrade is already running.")
+            return
+        if not devices:
+            self._message("Check at least one device first.")
+            return
+        def shown_version(device):
+            # The table displays at most 18 characters of the version.
+            value = str(device.get("version") or "").strip()
+            return value[:18] if value else "unknown"
+
+        versions = {shown_version(device) for device in devices}
+        if len(versions) > 1:
+            details = "\n".join(
+                "%s: %s" % (
+                    device.get("ip") or device.get("cloud_id") or "?",
+                    shown_version(device))
+                for device in devices)
+            answer = QMessageBox.warning(
+                self, "Firmware versions",
+                "Selected devices have different firmware versions:\n\n%s"
+                "\n\nContinue with the same firmware file anyway?" % details,
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if len(devices) == 1:
+            target = devices[0].get("ip") or "1 device"
+        else:
+            target = "%d devices" % len(devices)
         answer = QMessageBox.question(
             self, "Upgrade firmware",
-            "Upload %s to %s?\n\nThe device will upgrade and may reboot." % (
-                os.path.basename(path), device.get("ip") or ""))
+            "Upload %s to %s?\n\n"
+            "The selected devices will upgrade and may reboot." % (
+                os.path.basename(path), target))
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self._start_system_action(
-            "upgrade", changes={"filename": path},
-            label="Uploading firmware to", device=device)
+        self._pause_search()
+        self._upgrade_filename = path
+        self._upgrade_queue = list(devices)
+        self._upgrade_total = len(devices)
+        self._upgrade_done = 0
+        self._upgrade_failed = 0
+        self._upgrade_active = True
+        for device in devices:
+            identity = DeviceTableModel.identity(device)
+            self.model.set_provision_state(identity, "active")
+            self.model.set_progress(identity, 0)
+        self._update_upgrade_controls()
+        self._message("Upgrading firmware on %d device(s) ..." % len(devices))
+        self._start_next_upgrade_job()
+
+    def _release_upgrade_slot(self, identity):
+        """Free one upload slot as soon as the device starts flashing."""
+        if identity not in self._upgrade_uploading:
+            return
+        self._upgrade_uploading.discard(identity)
+        self._start_next_upgrade_job()
+
+    def _start_next_upgrade_job(self):
+        # Only uploads consume bandwidth; device-side flashing can continue
+        # in the background while the freed slot starts another upload.
+        while (self._upgrade_queue
+               and len(self._upgrade_uploading) < MAX_PARALLEL_UPLOADS):
+            device = self._upgrade_queue.pop(0)
+            identity = DeviceTableModel.identity(device)
+            self.model.set_provision_state(identity, "active")
+            self.model.set_progress(identity, 0)
+            self._upgrade_uploading.add(identity)
+            username, password = self._device_credentials(device)
+            thread = NetipThread(
+                "upgrade",
+                device.get("ip") or "",
+                username,
+                password,
+                cloud_id=device.get("cloud_id") or "",
+                rps=bool(device.get("rps", True)),
+                changes={"filename": self._upgrade_filename},
+                port=int(device.get("tcp_port") or 34567),
+                parent=self,
+                no_md5=bool(device.get("no_md5")))
+            thread.progress.connect(
+                lambda text, dev=device:
+                self._on_upgrade_progress(dev, text))
+            thread.applied.connect(
+                lambda payload, dev=device:
+                self._on_upgrade_result(dev, payload))
+            thread.failed.connect(
+                lambda text, dev=device:
+                self._on_upgrade_failed(dev, text))
+            thread.finished.connect(
+                lambda t=thread, dev=device:
+                self._on_upgrade_finished(t, dev))
+            thread.finished.connect(thread.deleteLater)
+            self._upgrade_threads.append(thread)
+            thread.start()
+        if not self._upgrade_queue and not self._upgrade_threads:
+            self._upgrade_active = False
+            self._update_upgrade_controls()
+            self._message("Firmware upgrade done: %d ok, %d failed." % (
+                self._upgrade_done, self._upgrade_failed))
+            self._resume_search()
+
+    def _on_upgrade_progress(self, device, text):
+        identity = DeviceTableModel.identity(device)
+        label = device.get("ip") or device.get("cloud_id") or "device"
+        message = str(text or "").strip()
+        if message:
+            lower = message.lower()
+            match = re.search(r"(\d+(?:\.\d+)?)\s*%", message)
+            if match:
+                try:
+                    percent = float(match.group(1))
+                except ValueError:
+                    percent = 0.0
+                if lower.startswith("uploading"):
+                    percent *= 0.5
+                elif lower.startswith("upgrading"):
+                    percent = 50.0 + percent * 0.5
+                    self._release_upgrade_slot(identity)
+                self.model.set_progress(identity, int(round(percent)))
+            elif lower.startswith("upgrading"):
+                self._release_upgrade_slot(identity)
+            self._message("Upgrading %s: %s" % (label, message))
+
+    def _on_upgrade_result(self, device, payload):
+        identity = DeviceTableModel.identity(device)
+        self._release_upgrade_slot(identity)
+        label = device.get("ip") or identity
+        result = payload.get("Upgrade") if isinstance(payload, dict) else None
+        ret = result.get("Ret") if isinstance(result, dict) else None
+        if result is None or ret == 515:
+            self._upgrade_done += 1
+            self.model.set_progress(identity, 100)
+            self.model.set_provision_state(identity, "ok")
+            self._message("Firmware upgraded on %s" % label)
+        else:
+            self._upgrade_failed += 1
+            self.model.set_provision_state(identity, "failed")
+            self._message("Firmware upgrade on %s failed: Ret=%s (%s)" % (
+                label, ret, RESULT_CODES.get(ret, "unknown")))
+
+    def _on_upgrade_failed(self, device, text):
+        identity = DeviceTableModel.identity(device)
+        self._release_upgrade_slot(identity)
+        self._upgrade_failed += 1
+        self.model.set_provision_state(identity, "failed")
+        self._message("Firmware upgrade on %s failed: %s" % (
+            device.get("ip") or identity, text))
+
+    def _on_upgrade_finished(self, thread, device):
+        if thread in self._upgrade_threads:
+            self._upgrade_threads.remove(thread)
+        identity = DeviceTableModel.identity(device)
+        self._upgrade_uploading.discard(identity)
+        self.model.clear_progress(identity)
+        self._start_next_upgrade_job()
 
     def _cloud_upgrade(self):
         device = self._system_target()
@@ -13911,11 +15061,14 @@ class MainWindow(QMainWindow):
         self._system_error = False
         self._set_system_busy(False)
         self._update_encode_table_button()
+        self._update_camera_table_button()
         self._fetch_in_progress = False
         if self._pending_fetch_keys and self._connected_identity is not None:
             pending = set(self._pending_fetch_keys)
             self._pending_fetch_keys = set()
             self._request_fetch(pending)
+        if not self._start_next_system_job():
+            self._sync_session_monitor()
 
     def _table_context_menu(self, point):
         menu = QMenu(self)
@@ -13926,8 +15079,10 @@ class MainWindow(QMainWindow):
         copy_action.triggered.connect(
             lambda: QApplication.clipboard().setText(text))
         menu.addSeparator()
-        menu.addAction("Select all", lambda: self.model.set_all_checked(True))
-        menu.addAction("Deselect all", lambda: self.model.set_all_checked(False))
+        menu.addAction(
+            "Select all", lambda: self._set_all_checked_filtered(True))
+        menu.addAction(
+            "Deselect all", lambda: self._set_all_checked_filtered(False))
         menu.addSeparator()
         menu.addAction("Add", self._add_device)
         menu.addAction("Modify", self._modify_device)
@@ -13996,12 +15151,19 @@ class MainWindow(QMainWindow):
         self._message("Cleared.")
 
     def _target_device(self):
-        checked = self.model.checked_devices()
-        if checked:
-            return checked[0]
+        # A connected/selected device must win over stale table check marks:
+        # mass operations leave devices checked, and targeting the first
+        # checked row could otherwise show or configure the wrong camera.
+        if self._connected_identity is not None:
+            device = self._device_by_identity(self._connected_identity)
+            if isinstance(device, dict):
+                return device
         rows = self.table.selectionModel().selectedRows()
         if rows:
             return self.model.device_at(rows[0].row())
+        checked = self.model.checked_devices()
+        if checked:
+            return checked[0]
         return None
 
     def _set_channel_count(self, count):
@@ -14105,10 +15267,14 @@ class MainWindow(QMainWindow):
             return
         username, password = self._device_credentials(device)
         stream = "Sub" if self._stream() else "Main"
+        # Free the keepalive session before opening the video session; the
+        # monitor is not needed while a real stream is active.
+        self._stop_session()
         started = self.video_panel.start(
             device, username, password, stream=stream,
             channel=max(0, self._channel() - 1))
         if not started:
+            self._sync_session_monitor()
             return
         self._video_device = device
         self._video_credentials = (username, password)
@@ -14117,8 +15283,9 @@ class MainWindow(QMainWindow):
         self.middle_stack.setCurrentWidget(self.video_status_label)
         self._message("NETIP video: %s" % (
             device.get("cloud_id") or device.get("ip") or ""))
+        self._sync_session_monitor()
 
-    def _stop_video(self):
+    def _stop_video(self, restart_monitor=True):
         self._video_device = None
         self.video_panel.stop()
         self.table_stack.setCurrentWidget(self.table)
@@ -14126,6 +15293,8 @@ class MainWindow(QMainWindow):
         self.video_status_label.setText("")
         self.middle_stack.setCurrentWidget(self.status_label)
         self._message("Video stopped")
+        if restart_monitor:
+            self._sync_session_monitor()
 
     def _video_source_changed(self, *_):
         if not self.video_panel.is_active() or self._video_device is None:
@@ -14640,6 +15809,15 @@ class MainWindow(QMainWindow):
         self._pass_thread = None
         if pass_thread is not None:
             pass_thread.wait(10000)
+        upgrade_threads = list(self._upgrade_threads)
+        self._upgrade_threads = []
+        self._upgrade_uploading.clear()
+        self._upgrade_active = False
+        self._upgrade_queue = []
+        for thread in upgrade_threads:
+            thread.cancel()
+        for thread in upgrade_threads:
+            thread.wait(3000)
         probe_thread = self._probe_thread
         self._probe_thread = None
         if probe_thread is not None:
@@ -14648,6 +15826,7 @@ class MainWindow(QMainWindow):
         self._release_thread = None
         if release_thread is not None:
             release_thread.wait(6000)
+        self._netip_queue.clear()
         netip_thread = self._netip_thread
         self._netip_thread = None
         if netip_thread is not None:

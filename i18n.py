@@ -69,7 +69,11 @@ RU = {
     "entries": "записей",
     "Start date is after end date.": "Начальная дата позже конечной.",
     "No logs returned.": "Записи журнала не получены.",
-    "NetIP operation already running.": "Операция NetIP уже выполняется.",
+    "No camera settings changed.": "Настройки камеры не изменены.",
+    "No encode settings changed.": "Настройки кодирования не изменены.",
+    "NetIP operation cancelled.": "Операция NetIP отменена.",
+    "Cancel the current and queued NetIP operations.":
+        "Отменить текущую и ожидающие операции NetIP.",
     "No database configured.": "База данных не настроена.",
     "Open Configure and enter the database password.":
         "Откройте «Настроить» и введите пароль базы данных.",
@@ -290,6 +294,15 @@ RU = {
     "IR-CUT mode:": "IR-CUT:",
     "DNC threshold:": "Порог DNC:",
     "DN switch:": "Перекл. DN:",
+    "DN adjustment:": "Регулировка DN:",
+    "Day/Night switch:": "Переключатель день/ночь:",
+    "Day/Night switch Day or Night mode overrides this setting.":
+        "Режим «День» или «Ночь» переключателя день/ночь переопределяет эту настройку.",
+    "DN switch": "Перекл. DN",
+    "Auto change": "Авто",
+    "Day mode": "День",
+    "Night mode": "Ночь",
+    "Clock mode": "По расписанию",
     "Style:": "Стиль:",
     "DWDR:": "DWDR:",
     "Strength:": "Сила:",
