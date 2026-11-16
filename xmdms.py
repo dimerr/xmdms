@@ -1,5 +1,6 @@
 import base64
 import calendar
+import copy
 import csv
 import hashlib
 import importlib.util
@@ -189,7 +190,7 @@ try:
         QMediaDevices,
         QMediaPlayer,
     )
-    from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+    from PySide6.QtMultimediaWidgets import QGraphicsVideoItem, QVideoWidget
     QT_MULTIMEDIA = True
 except Exception:
     QAudioFormat = None
@@ -197,6 +198,7 @@ except Exception:
     QMediaDevices = None
     QMediaPlayer = None
     QGraphicsVideoItem = None
+    QVideoWidget = None
     QT_MULTIMEDIA = False
 
 try:
@@ -4995,6 +4997,7 @@ class DigitalChannelsDialog(QDialog):
         self._local_devices = []
         self._search_checked = set()
         self._remote_entries = []
+        self._channel_clipboard = None
         self._titles = []
         self._time_syn = []
         self._decode_param = []
@@ -5050,7 +5053,10 @@ class DigitalChannelsDialog(QDialog):
 
         self.channel_table = QTableWidget(0, len(self.CHANNEL_COLUMNS))
         self.channel_table.setHorizontalHeaderLabels(self.CHANNEL_COLUMNS)
-        install_copy_menu(self.channel_table)
+        self.channel_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.channel_table.customContextMenuRequested.connect(
+            self._channel_context_menu)
         self.channel_table.setEditTriggers(
             QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.EditKeyPressed)
         self.channel_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -5067,11 +5073,27 @@ class DigitalChannelsDialog(QDialog):
         header.resizeSection(self.COL_USER, text_width)
         header.resizeSection(self.COL_PASSWORD, text_width)
 
+        self.copy_channel_button = QPushButton("Copy")
+        self.copy_channel_button.setToolTip(
+            "Copy the selected channel row.")
+        self.copy_channel_button.clicked.connect(
+            self._copy_selected_channel)
+        self.paste_channel_button = QPushButton("Paste")
+        self.paste_channel_button.setToolTip(
+            "Paste the copied channel row into the selected row.")
+        self.paste_channel_button.clicked.connect(
+            self._paste_selected_channel)
+        self.channel_table.itemSelectionChanged.connect(
+            self._update_channel_buttons)
+
         middle_bar = QHBoxLayout()
         middle_bar.addWidget(self.search_button)
         middle_bar.addWidget(QLabel("Search type:"))
         middle_bar.addWidget(self.search_type_combo)
         middle_bar.addWidget(self.add_ipc_button)
+        middle_bar.addSpacing(8)
+        middle_bar.addWidget(self.copy_channel_button)
+        middle_bar.addWidget(self.paste_channel_button)
         middle_bar.addWidget(QLabel("Start IP:"))
         middle_bar.addWidget(self.provision_ip_edit)
         middle_bar.addWidget(self.provision_button)
@@ -5094,6 +5116,7 @@ class DigitalChannelsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(splitter, 1)
 
+        self._update_channel_buttons()
         self._start("remote_devices", self._on_remote_devices)
 
     def _build_apply_panel(self):
@@ -5714,7 +5737,7 @@ class DigitalChannelsDialog(QDialog):
             protocol = "ONVIF"
         else:
             protocol = "NETIP"
-        self._set_check_item(row, self.COL_ON, True)
+        self._set_channel_enabled(row, True)
         self._set_text_item(row, self.COL_NAME, name)
         self._set_text_item(row, self.COL_IP, format_ipv4(device.get("HostIP")))
         self._set_text_item(row, self.COL_PORT, self._text(device.get("TCPPort") or 34567))
@@ -5749,6 +5772,200 @@ class DigitalChannelsDialog(QDialog):
     def _combo_text(self, row, column):
         combo = self.channel_table.cellWidget(row, column)
         return combo.currentText() if combo is not None else ""
+
+    @staticmethod
+    def _row_flag(value):
+        return str(value or "").strip().lower() in (
+            "1", "true", "yes", "on", "checked")
+
+    def _set_channel_enabled(self, row, enabled):
+        """Keep the visible On state and both stored enable flags in sync."""
+        enabled = bool(enabled)
+        self._set_check_item(row, self.COL_ON, enabled)
+        while len(self._remote_entries) <= row:
+            self._remote_entries.append({})
+        entry = self._remote_entries[row]
+        if not isinstance(entry, dict):
+            entry = {}
+            self._remote_entries[row] = entry
+        entry["Enable"] = enabled
+        decoder = self._decoder(entry)
+        if isinstance(decoder, dict):
+            decoder["Enable"] = enabled
+
+    def _channel_row_values(self, row):
+        return [
+            "1" if self._cell_checked(row, self.COL_ON) else "0",
+            self._cell_text(row, self.COL_NAME),
+            self._cell_text(row, self.COL_IP),
+            self._cell_text(row, self.COL_PORT),
+            "1" if self._cell_checked(row, self.COL_SYNC_RES) else "0",
+            self._combo_text(row, self.COL_SYNC_TIME),
+            self._combo_text(row, self.COL_DELAY),
+            self._cell_text(row, self.COL_CHANNEL),
+            self._combo_text(row, self.COL_PROTOCOL),
+            self._cell_text(row, self.COL_USER),
+            self._cell_text(row, self.COL_PASSWORD),
+            self._cell_text(row, self.COL_CONFNAME),
+        ]
+
+    def _selected_channel_row(self):
+        rows = self.channel_table.selectionModel().selectedRows()
+        return rows[0].row() if rows else -1
+
+    def _channel_clipboard_payload(self):
+        if self._channel_clipboard is not None:
+            return self._channel_clipboard
+        text = QApplication.clipboard().text()
+        if not text:
+            return None
+        values = text.strip("\r\n").split("\t")
+        if len(values) != len(self.CHANNEL_COLUMNS):
+            return None
+        return {"values": values, "entry": {}}
+
+    def _update_channel_buttons(self):
+        row = self._selected_channel_row()
+        self.copy_channel_button.setEnabled(row >= 0)
+        self.paste_channel_button.setEnabled(
+            row >= 0 and self._channel_clipboard_payload() is not None)
+
+    def _copy_channel_row(self, row):
+        if not 0 <= row < self.channel_table.rowCount():
+            return
+        entry = (self._remote_entries[row]
+                 if row < len(self._remote_entries) else {})
+        values = self._channel_row_values(row)
+        self._channel_clipboard = {
+            "values": list(values),
+            "entry": copy.deepcopy(entry) if isinstance(entry, dict) else {},
+        }
+        QApplication.clipboard().setText("\t".join(values))
+        self.provision_status.setText("Channel row copied.")
+        self._update_channel_buttons()
+
+    def _copy_selected_channel(self):
+        row = self._selected_channel_row()
+        if row < 0:
+            self.provision_status.setText("Select a channel row first.")
+            return
+        self._copy_channel_row(row)
+
+    def _paste_channel_row(self, row):
+        if not 0 <= row < self.channel_table.rowCount():
+            return
+        payload = self._channel_clipboard_payload()
+        if payload is None:
+            self.provision_status.setText("Copy a channel row first.")
+            return
+        values = list(payload.get("values") or [])
+        if len(values) != len(self.CHANNEL_COLUMNS):
+            self.provision_status.setText("Clipboard does not contain a channel row.")
+            return
+        entry = payload.get("entry")
+        while len(self._remote_entries) <= row:
+            self._remote_entries.append({})
+        if isinstance(entry, dict) and entry:
+            self._remote_entries[row] = copy.deepcopy(entry)
+        self._set_text_item(row, self.COL_NAME, values[1])
+        self._set_text_item(row, self.COL_IP, values[2])
+        self._set_text_item(row, self.COL_PORT, values[3])
+        self._set_check_item(
+            row, self.COL_SYNC_RES, self._row_flag(values[4]))
+        self._set_combo_item(
+            row, self.COL_SYNC_TIME, self.SYNC_TIME_OPTIONS, values[5])
+        self._set_combo_item(
+            row, self.COL_DELAY,
+            [str(value) for value in self.DELAY_OPTIONS], values[6])
+        self._set_text_item(row, self.COL_CHANNEL, values[7])
+        self._set_combo_item(
+            row, self.COL_PROTOCOL, self.PROTOCOL_OPTIONS, values[8])
+        self._set_text_item(row, self.COL_USER, values[9])
+        self._set_text_item(row, self.COL_PASSWORD, values[10])
+        self._set_text_item(row, self.COL_CONFNAME, values[11])
+        enabled = self._row_flag(values[0])
+        self._set_channel_enabled(row, enabled)
+        while len(self._titles) <= row:
+            self._titles.append("")
+        while len(self._time_syn) <= row:
+            self._time_syn.append({})
+        while len(self._decode_param) <= row:
+            self._decode_param.append({})
+        self._titles[row] = values[1]
+        self._time_syn[row] = values[5]
+        self._decode_param[row] = self._to_int(
+            values[6], self.DELAY_DEFAULT)
+        self.provision_status.setText("Channel row pasted.")
+        self._refresh_local_table()
+        self._update_channel_buttons()
+
+    def _paste_selected_channel(self):
+        row = self._selected_channel_row()
+        if row < 0:
+            self.provision_status.setText("Select a channel row first.")
+            return
+        self._paste_channel_row(row)
+
+    def _delete_channel_row(self, row):
+        if not 0 <= row < self.channel_table.rowCount():
+            return
+        while len(self._remote_entries) <= row:
+            self._remote_entries.append({})
+        base = self._remote_entries[row]
+        entry = copy.deepcopy(base) if isinstance(base, dict) else {}
+        entry["Decoder"] = None
+        entry["Enable"] = False
+        self._remote_entries[row] = entry
+        self._set_channel_enabled(row, False)
+        self._set_text_item(row, self.COL_NAME, "")
+        self._set_text_item(row, self.COL_IP, "")
+        self._set_text_item(row, self.COL_PORT, "")
+        self._set_check_item(row, self.COL_SYNC_RES, False)
+        self._set_combo_item(
+            row, self.COL_SYNC_TIME, self.SYNC_TIME_OPTIONS, "OFF")
+        self._set_combo_item(
+            row, self.COL_DELAY,
+            [str(value) for value in self.DELAY_OPTIONS],
+            str(self.DELAY_DEFAULT))
+        self._set_text_item(row, self.COL_CHANNEL, "")
+        self._set_combo_item(
+            row, self.COL_PROTOCOL, self.PROTOCOL_OPTIONS, "NETIP")
+        self._set_text_item(row, self.COL_USER, "admin")
+        self._set_text_item(row, self.COL_PASSWORD, "")
+        self._set_text_item(row, self.COL_CONFNAME, "")
+        while len(self._titles) <= row:
+            self._titles.append("")
+        while len(self._time_syn) <= row:
+            self._time_syn.append({})
+        while len(self._decode_param) <= row:
+            self._decode_param.append({})
+        self._titles[row] = ""
+        self._time_syn[row] = "OFF"
+        self._decode_param[row] = self.DELAY_DEFAULT
+        self.provision_status.setText("Channel row deleted.")
+        self._refresh_local_table()
+        self._update_channel_buttons()
+
+    def _channel_context_menu(self, point):
+        index = self.channel_table.indexAt(point)
+        if not index.isValid():
+            return
+        row = index.row()
+        self.channel_table.selectRow(row)
+        menu = QMenu(self.channel_table)
+        copy_action = menu.addAction("Copy")
+        copy_action.triggered.connect(
+            lambda: self._copy_channel_row(row))
+        paste_action = menu.addAction("Paste")
+        paste_action.setEnabled(
+            self._channel_clipboard_payload() is not None)
+        paste_action.triggered.connect(
+            lambda: self._paste_channel_row(row))
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete")
+        delete_action.triggered.connect(
+            lambda: self._delete_channel_row(row))
+        menu.exec(self.channel_table.viewport().mapToGlobal(point))
 
     @staticmethod
     def _to_int(text, default):
@@ -6619,7 +6836,8 @@ class VideoView(QGraphicsView):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setBackgroundBrush(QColor(16, 16, 16))
-        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        # Fast scaling matters more than smoothing for live video.
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         self.setScene(QGraphicsScene(self))
         self.video_item = QGraphicsVideoItem()
         self.video_item.setAspectRatioMode(
@@ -6694,15 +6912,24 @@ class VideoPanel(QWidget):
         self._preroll_feed_timer.timeout.connect(self._feed_preroll)
         self.codec = None
         self._backend = self._choose_backend()
+        self._video_sink = None
+        self._video_output = None
 
         minimum_video = QSize(48, 27) if compact else QSize(320, 180)
         self.video_label = QLabel("no video")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setMinimumSize(minimum_video)
         self.video_label.setStyleSheet("background-color: #101010; color: #808080;")
-        self.video_view = VideoView() if QT_MULTIMEDIA else None
+        self.video_widget = QVideoWidget() if QT_MULTIMEDIA else None
+        # Compact split tiles never use the focus overlay, so keep them on the
+        # fast native video surface only.
+        self.video_view = (
+            VideoView() if QT_MULTIMEDIA and not compact else None)
         self._stack = QStackedWidget()
         self._stack.addWidget(self.video_label)
+        if self.video_widget is not None:
+            self.video_widget.setMinimumSize(minimum_video)
+            self._stack.addWidget(self.video_widget)
         if self.video_view is not None:
             self.video_view.setMinimumSize(minimum_video)
             self._stack.addWidget(self.video_view)
@@ -6778,13 +7005,14 @@ class VideoPanel(QWidget):
 
         self._stream_device = None
         self._player = QMediaPlayer(self) if QT_MULTIMEDIA else None
-        if self._player is not None and self.video_view is not None:
-            self._player.setVideoOutput(self.video_view.video_item)
+        if self._player is not None:
+            output = self._active_video_output()
+            if output is not None:
+                self._player.setVideoOutput(output)
+                self._video_output = output
             self._player.errorOccurred.connect(self._on_qt_error)
             self._player.mediaStatusChanged.connect(self._on_qt_media_status)
-            sink = self._player.videoSink()
-            if sink is not None:
-                sink.videoFrameChanged.connect(self._on_video_frame)
+            self._connect_video_sink()
         self._decoder = MjpegDecoder(self)
         self._decoder.frame_ready.connect(self._on_frame)
         self._decoder.failed.connect(self._on_decoder_failed)
@@ -6958,8 +7186,7 @@ class VideoPanel(QWidget):
                   "jpeg": "mjpeg"}.get(self._qt_codec or "", "bin")
         self._player.setSourceDevice(device, QUrl("stream." + suffix))
         self._player.play()
-        if self.video_view is not None:
-            self._stack.setCurrentWidget(self.video_view)
+        self._apply_video_surface()
 
     def _on_video_frame(self, frame):
         if frame.isValid():
@@ -7016,6 +7243,50 @@ class VideoPanel(QWidget):
     def _set_status(self, text):
         self.status_changed.emit(text)
 
+    def _active_video_output(self):
+        if self._player is None:
+            return None
+        if (not self._compact and self.focus_button.isChecked()
+                and self.video_view is not None):
+            return self.video_view.video_item
+        return self.video_widget
+
+    def _active_video_widget(self):
+        if (not self._compact and self.focus_button.isChecked()
+                and self.video_view is not None):
+            return self.video_view
+        return self.video_widget
+
+    def _connect_video_sink(self):
+        if self._player is None:
+            return
+        sink = self._player.videoSink()
+        if sink is self._video_sink:
+            return
+        if self._video_sink is not None:
+            try:
+                self._video_sink.videoFrameChanged.disconnect(
+                    self._on_video_frame)
+            except (RuntimeError, TypeError):
+                pass
+        self._video_sink = sink
+        if sink is not None:
+            sink.videoFrameChanged.connect(self._on_video_frame)
+
+    def _apply_video_surface(self):
+        if self._player is None or self._backend != "qt":
+            return
+        output = self._active_video_output()
+        if output is None:
+            return
+        if output is not self._video_output:
+            self._player.setVideoOutput(output)
+            self._video_output = output
+        self._connect_video_sink()
+        widget = self._active_video_widget()
+        if widget is not None and self._active:
+            self._stack.setCurrentWidget(widget)
+
     def _toggle_focus(self, checked):
         if checked and not self._active:
             self.focus_button.blockSignals(True)
@@ -7024,8 +7295,10 @@ class VideoPanel(QWidget):
             return
         if not checked:
             self.focus_overlay.hide()
+            self._apply_video_surface()
             return
         self._focus_last = 0.0
+        self._apply_video_surface()
         self.focus_overlay.set_frame_size(self._frame_size)
         self.focus_overlay.clear()
         self._position_focus_overlay()
@@ -8778,8 +9051,8 @@ class DatabasePanel(QWidget):
             connect = menu.addAction(tr("Connect"))
             connect.triggered.connect(
                 lambda: self.device_activated.emit(dict(data)))
-            copy = menu.addAction(tr("Copy address"))
-            copy.triggered.connect(
+            copy_action = menu.addAction(tr("Copy address"))
+            copy_action.triggered.connect(
                 lambda: QApplication.clipboard().setText(
                     str(data.get("ip") or data.get("cloud_id") or "")))
         menu.exec(self.tree.viewport().mapToGlobal(point))
