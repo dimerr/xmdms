@@ -56,7 +56,7 @@ single PySide6 UI.
 | **Network** | LAN address, subnet, gateway, DHCP/DNS, HTTP/TCP/RTSP/ONVIF ports, Wi-Fi scan and security, UPnP, SmartNet, PMS, VNIC, NAT/RPS, NTP, firmware upload and cloud upgrade. |
 | **System** | Hardware/software/cloud ID, runtime age, channel count, device type, NAT status, TV standard, device language, restart schedule, time zone, date/time format, beeper, face/debug flags, audio input, cloud-ID QR code, time sync, reboot, config import/export/reset, device logs and firmware utilities. |
 | **Display** | Video output resolution, GUI feature flags and window alpha. |
-| **Encode** | Per-channel main stream and substream: H.264/H.265, resolution, FPS, CBR/VBR rate control, quality, bitrate, I-frame interval, smart H.265+/H.265AI, audio/video enable. Includes an all-channels editor. |
+| **Encode** | Per-channel main stream and substream: H.264/H.265, resolution, FPS, CBR/VBR rate control, quality, bitrate, I-frame interval, smart H.265+/H.265AI, audio/video enable. Includes an all-channels editor and a channel status block (connected/offline/not configured). |
 | **Camera** | Day/night mode and switch schedule, white balance, BLC, aperture, exposure, shutter, gain, AE sensitivity, day/night noise filters, IR-cut, DNC threshold, DWDR, flip/mirror, flicker rejection and white-light controls. |
 | **Storage** | Disk list, read/write, read-only, redundant and snapshot modes, format and recover actions. |
 | **Users** | User and group lists, add/modify/delete users and groups, and change user passwords. |

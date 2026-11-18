@@ -10896,6 +10896,7 @@ class MainWindow(QMainWindow):
         self._encode_max_fps = 25
         self._encode_resolution_names = []
         self._encode_channel_names = []
+        self._encode_channel_statuses = []
 
         encode_grid = QGridLayout()
         encode_grid.setHorizontalSpacing(8)
@@ -10941,11 +10942,20 @@ class MainWindow(QMainWindow):
         self.encode_summary_grid.setVerticalSpacing(2)
         self.encode_summary_group.setVisible(False)
 
+        self.encode_status_group = QGroupBox("Status")
+        self.encode_status_group.setStyleSheet(GROUP_BOX_STYLE)
+        self.encode_status_grid = QGridLayout(self.encode_status_group)
+        self.encode_status_grid.setContentsMargins(4, 4, 4, 4)
+        self.encode_status_grid.setHorizontalSpacing(10)
+        self.encode_status_grid.setVerticalSpacing(2)
+        self.encode_status_group.setVisible(False)
+
         encode_panel = QWidget()
         encode_layout = QVBoxLayout(encode_panel)
         encode_layout.setContentsMargins(4, 4, 4, 4)
         encode_layout.addLayout(encode_grid)
         encode_layout.addWidget(self.encode_summary_group)
+        encode_layout.addWidget(self.encode_status_group)
         encode_layout.addStretch(1)
         self.tabs.addTab(encode_panel, "Encode")
 
@@ -12368,6 +12378,7 @@ class MainWindow(QMainWindow):
         self.system_dump_button.setEnabled(True)
         self.system_open_dir_button.setEnabled(True)
         self.encode_summary_group.setVisible(False)
+        self.encode_status_group.setVisible(False)
         self._update_cloud_qr("")
 
     def _refresh_age_label(self):
@@ -12409,6 +12420,7 @@ class MainWindow(QMainWindow):
             for widget in panel.findChildren(QWidget):
                 widget.blockSignals(False)
         self.encode_summary_group.setVisible(False)
+        self.encode_status_group.setVisible(False)
         self._update_cloud_qr("")
 
     @staticmethod
@@ -12570,6 +12582,9 @@ class MainWindow(QMainWindow):
         self._encode_mode = None
         self._encode_current = None
         self._encode_channel_names = []
+        self._encode_channel_statuses = []
+        self.encode_summary_group.setVisible(False)
+        self.encode_status_group.setVisible(False)
         for combo in (getattr(self, "camera_channel_combo", None),
                       getattr(self, "encode_channel_combo", None)):
             if combo is None:
@@ -12877,6 +12892,9 @@ class MainWindow(QMainWindow):
         self._fit_system_buttons()
         self.model.headerDataChanged.emit(
             Qt.Orientation.Horizontal, 0, self.model.columnCount() - 1)
+        if hasattr(self, "encode_status_grid"):
+            self._refresh_encode_summary()
+            self._refresh_encode_status()
         self.status_label.setText(self._refresh_status_text())
 
     def _update_language_combo_labels(self):
@@ -13512,10 +13530,14 @@ class MainWindow(QMainWindow):
         self._encode_smart = smart if isinstance(smart, list) else []
         status = payload.get("chn_status")
         self._encode_channel_names = []
+        self._encode_channel_statuses = []
         if isinstance(status, list):
             for item in status:
                 self._encode_channel_names.append(
                     str(item.get("ChnName") or "").strip()
+                    if isinstance(item, dict) else "")
+                self._encode_channel_statuses.append(
+                    str(item.get("Status") or "").strip()
                     if isinstance(item, dict) else "")
         if isinstance(configs, list) and configs:
             self._encode_mode = "nvr"
@@ -13562,6 +13584,7 @@ class MainWindow(QMainWindow):
         else:
             self._encode_load_channel(None)
         self._refresh_encode_summary()
+        self._refresh_encode_status()
         self._update_encode_table_button()
 
     def _encode_smart_changes(self):
@@ -13596,6 +13619,49 @@ class MainWindow(QMainWindow):
             return
         self._encode_store_current()
         self._refresh_encode_summary()
+
+    @staticmethod
+    def _channel_status_text(value):
+        text = str(value or "").strip()
+        mapping = {
+            "connected": "Connected",
+            "offline": "Offline",
+            "noconfig": "Not Configured",
+            "notconfig": "Not Configured",
+            "not configured": "Not Configured",
+            "disconnected": "Disconnected",
+        }
+        return tr(mapping.get(text.casefold(), text)) if text else tr("Unknown")
+
+    def _refresh_encode_status(self):
+        grid = self.encode_status_grid
+        while grid.count():
+            item = grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        statuses = self._encode_channel_statuses
+        count = self.encode_channel_combo.count()
+        if count <= 0:
+            count = len(statuses)
+        if not statuses or count <= 0:
+            self.encode_status_group.setVisible(False)
+            return
+        for chn in range(count):
+            value = statuses[chn] if chn < len(statuses) else ""
+            status = self._channel_status_text(value)
+            name = (self._encode_channel_names[chn]
+                    if chn < len(self._encode_channel_names) else "")
+            label = QLabel("CAM%02d  %s" % (chn + 1, status))
+            label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            details = "Channel %d" % (chn + 1)
+            if name:
+                details += ": %s" % name
+            label.setToolTip("%s\nStatus: %s" % (details, status))
+            grid.addWidget(label, chn // 2, chn % 2)
+        self.encode_status_group.setVisible(True)
 
     def _refresh_encode_summary(self):
         grid = self.encode_summary_grid
