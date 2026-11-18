@@ -270,7 +270,8 @@ IP_SET_RSP = 1533
 PROBE_INTERVAL = 1.0
 SET_TIMEOUT = 3.0
 MAX_PARALLEL_UPLOADS = 4
-CONNECTED_BRUSH = QBrush(QColor("#A5D6A7"))
+CONNECTED_BRUSH = QBrush(QColor("#43A047"))
+CONNECTED_TEXT = QColor("#10240F")
 PROVISION_OK_BRUSH = QBrush(QColor("#A5D6A7"))
 PROVISION_FAILED_BRUSH = QBrush(QColor("#EF9A9A"))
 PROVISION_ACTIVE_BRUSH = QBrush(QColor("#FFF59D"))
@@ -920,6 +921,21 @@ def next_ip_address(value):
     if number >= 0xFFFFFFFF:
         return ""
     return str(ipaddress.IPv4Address(number + 1))
+
+
+def device_host_kind(value):
+    """Classify a CloudID/host entry as an IPv4 address, domain or serial."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        ipaddress.IPv4Address(text)
+        return "ip"
+    except (ipaddress.AddressValueError, ValueError):
+        pass
+    if "." in text and " " not in text:
+        return "domain"
+    return "sn"
 
 
 def build_port_edit(value):
@@ -3295,6 +3311,7 @@ class ReleaseCheckThread(QThread):
 class DeviceTableModel(QAbstractTableModel):
     SORT_ROLE = Qt.ItemDataRole.UserRole + 1
     PROGRESS_ROLE = Qt.ItemDataRole.UserRole + 2
+    CONNECTED_ROLE = Qt.ItemDataRole.UserRole + 3
     check_state_changed = Signal(object)
     COLUMNS = (
         ("", "check"),
@@ -3309,7 +3326,16 @@ class DeviceTableModel(QAbstractTableModel):
 
     @staticmethod
     def identity(device):
-        return device.get("cloud_id") or device.get("sn") or device.get("ip")
+        cloud_id = str(device.get("cloud_id") or "").strip()
+        if cloud_id and device_host_kind(cloud_id) == "sn":
+            return cloud_id
+        sn = str(device.get("sn") or "").strip()
+        if sn:
+            return sn
+        host = cloud_id or str(device.get("ip") or "").strip()
+        if not host:
+            return ""
+        return "%s:%s" % (host, device.get("tcp_port") or 34567)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3357,6 +3383,8 @@ class DeviceTableModel(QAbstractTableModel):
         device = self._devices[index.row()]
         if role == self.PROGRESS_ROLE:
             return self._progress.get(self.identity(device))
+        if role == self.CONNECTED_ROLE:
+            return self.identity(device) in self._connected
         if role == Qt.ItemDataRole.BackgroundRole:
             identity = self.identity(device)
             state = self._provision.get(identity)
@@ -3378,8 +3406,14 @@ class DeviceTableModel(QAbstractTableModel):
                 return index.row() + 1
             return None
         value = device.get(key)
+        if key == "ip" and not value:
+            cloud = str(device.get("cloud_id") or "").strip()
+            if cloud and device_host_kind(cloud) != "sn":
+                value = cloud
         if key == "sn" and not value:
-            value = device.get("cloud_id")
+            cloud = str(device.get("cloud_id") or "").strip()
+            if cloud and device_host_kind(cloud) == "sn":
+                value = cloud
         if key == "sn" and not value:
             raw = device.get("raw") or {}
             value = raw.get("SerialNo") or raw.get("SN")
@@ -3609,7 +3643,47 @@ class DeviceTableModel(QAbstractTableModel):
                 self.index(len(self._devices) - 1, len(self.COLUMNS) - 1))
 
 
-class DeviceProgressDelegate(QStyledItemDelegate):
+class ConnectedRowDelegate(QStyledItemDelegate):
+    """Keep a connected row green even while it is selected."""
+
+    def _option(self, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        if index.data(DeviceTableModel.CONNECTED_ROLE):
+            opt.state = opt.state & (
+                QStyle.StateFlag.State_Enabled
+                | QStyle.StateFlag.State_On
+                | QStyle.StateFlag.State_Off
+                | QStyle.StateFlag.State_NoChange)
+            opt.showDecorationSelected = False
+            opt.backgroundBrush = CONNECTED_BRUSH
+            opt.palette.setColor(
+                QPalette.ColorRole.Base, CONNECTED_BRUSH.color())
+            opt.palette.setColor(
+                QPalette.ColorRole.AlternateBase, CONNECTED_BRUSH.color())
+            opt.palette.setColor(
+                QPalette.ColorRole.Text, CONNECTED_TEXT)
+            opt.palette.setColor(
+                QPalette.ColorRole.WindowText, CONNECTED_TEXT)
+            opt.palette.setColor(
+                QPalette.ColorRole.Highlight, CONNECTED_BRUSH.color())
+            opt.palette.setColor(
+                QPalette.ColorRole.HighlightedText, CONNECTED_TEXT)
+        return opt
+
+    def paint(self, painter, option, index):
+        if not index.data(DeviceTableModel.CONNECTED_ROLE):
+            super().paint(painter, option, index)
+            return
+        opt = self._option(option, index)
+        painter.fillRect(opt.rect, CONNECTED_BRUSH)
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+
+
+class DeviceProgressDelegate(ConnectedRowDelegate):
     """Draw a progress bar in the Host Name column during firmware upload."""
 
     def paint(self, painter, option, index):
@@ -3619,8 +3693,7 @@ class DeviceProgressDelegate(QStyledItemDelegate):
             return
         widget = option.widget
         style = widget.style() if widget is not None else QApplication.style()
-        base = QStyleOptionViewItem(option)
-        self.initStyleOption(base, index)
+        base = self._option(option, index)
         base.text = ""
         style.drawControl(
             QStyle.ControlElement.CE_ItemViewItem, base, painter, widget)
@@ -3766,15 +3839,16 @@ class AddDeviceDialog(QDialog):
         self.password_edit = QLineEdit()
         configure_password_edit(self.password_edit)
         self.cloud_edit = QLineEdit()
-        self.cloud_edit.setPlaceholderText("SN, overrides IP")
+        self.cloud_edit.setPlaceholderText("SN, domain or IP; overrides IP")
         self.cloud_edit.textChanged.connect(self._cloud_changed)
         self.rps_check = QCheckBox("RPS")
         self.rps_check.setChecked(True)
         if not cloud_patch_available():
-            note = "xmcloud.py not available — cloud/SN transport disabled"
-            self.cloud_edit.setEnabled(False)
-            self.rps_check.setEnabled(False)
+            note = ("xmcloud.py not available — SN transport disabled; "
+                    "domains and IPs still connect directly")
             self.cloud_edit.setToolTip(note)
+            self.rps_check.setEnabled(False)
+            self.rps_check.setChecked(False)
             self.rps_check.setToolTip(note)
 
         form = QGridLayout()
@@ -3791,7 +3865,7 @@ class AddDeviceDialog(QDialog):
         form.addWidget(self.user_edit, 2, 1)
         form.addWidget(QLabel("Password:"), 3, 0)
         form.addWidget(self.password_edit, 3, 1)
-        form.addWidget(QLabel("CloudID:"), 4, 0)
+        form.addWidget(QLabel("CloudID / host:"), 4, 0)
         form.addWidget(self.cloud_edit, 4, 1)
         form.addWidget(QLabel("Transport:"), 5, 0)
         form.addWidget(self.rps_check, 5, 1)
@@ -3806,10 +3880,12 @@ class AddDeviceDialog(QDialog):
         layout.addWidget(buttons)
 
     def _cloud_changed(self, text):
-        if not self.cloud_edit.isEnabled():
-            self.address_edit.setEnabled(True)
-            return
         self.address_edit.setEnabled(not text.strip())
+        kind = device_host_kind(text)
+        patch = cloud_patch_available()
+        self.rps_check.setEnabled(patch and kind in ("", "sn"))
+        if kind not in ("", "sn"):
+            self.rps_check.setChecked(False)
 
     def set_user(self, user):
         self.user_edit.setText(user or "admin")
@@ -3818,12 +3894,17 @@ class AddDeviceDialog(QDialog):
         self.password_edit.setText(password or "")
 
     def set_values(self, device):
-        self.address_edit.setValue(device.get("ip") or "")
+        ip = str(device.get("ip") or "")
+        cloud = str(device.get("cloud_id") or "")
+        if not cloud and ip and device_host_kind(ip) != "ip":
+            cloud = ip
+            ip = ""
+        self.address_edit.setValue(ip)
         self.port_spin.setValue(int(device.get("tcp_port") or 34567))
         self.no_md5_check.setChecked(bool(device.get("no_md5")))
         self.user_edit.setText(device.get("username") or "admin")
         self.password_edit.setText(device.get("password") or "")
-        self.cloud_edit.setText(device.get("cloud_id") or "")
+        self.cloud_edit.setText(cloud)
         self.rps_check.setChecked(bool(device.get("rps", True)))
         self._cloud_changed(self.cloud_edit.text())
 
@@ -5189,6 +5270,18 @@ class DumpDialog(QDialog):
         except ValueError:
             return int(text, 16)
 
+    @staticmethod
+    def _prepare_crypto(data):
+        """Normalize the 1 KiB crypto blob used by some firmware dumps.
+
+        Some tools hand over the blob with every byte shifted by +9.  When the
+        expected D2 D4 signature is absent, subtract 9 from each byte.
+        """
+        data = bytes(data)
+        if len(data) == 1024 and not data.startswith(b"\xD2\xD4"):
+            data = bytes((value - 9) & 0xFF for value in data)
+        return data
+
     def _crypto_end(self):
         if not hasattr(self, "crypto_edit"):
             return 0
@@ -5361,6 +5454,7 @@ class DumpDialog(QDialog):
             return
         crypto_path = self.crypto_edit.text().strip()
         crypto_written = False
+        crypto_adjusted = False
         if crypto_path:
             try:
                 with open(crypto_path, "rb") as handle:
@@ -5368,6 +5462,9 @@ class DumpDialog(QDialog):
             except OSError:
                 self._notify("Dump failed: cannot read the crypto file")
                 return
+            prepared = self._prepare_crypto(crypto)
+            crypto_adjusted = prepared != crypto
+            crypto = prepared
             try:
                 crypto_offset = self._crypto_offset()
             except (TypeError, ValueError):
@@ -5390,7 +5487,9 @@ class DumpDialog(QDialog):
         if skipped:
             details.append("%d skipped" % len(skipped))
         if crypto_written:
-            details.append("crypto included")
+            details.append(
+                "normalized crypto included" if crypto_adjusted
+                else "crypto included")
         if details:
             self._notify(
                 "Dump written successfully (%s)" % ", ".join(details))
@@ -8787,13 +8886,12 @@ def db_load_devices(connection, config):
         if password and bool(config.get("cms")):
             password = cms_decrypt_password(password)
         port = db_port(values.get(port_column)) if port_column else 34567
-        try:
-            ipaddress.ip_address(host)
-            cloud_id = ""
-            address = host
-        except ValueError:
+        if device_host_kind(host) == "sn":
             cloud_id = host
             address = ""
+        else:
+            cloud_id = ""
+            address = host
         device = manual_device(
             address, port, username or "admin", password,
             cloud_id=cloud_id, rps=bool(cloud_id))
@@ -9225,6 +9323,7 @@ class DatabaseDialog(QDialog):
 class DatabasePanel(QWidget):
     device_activated = Signal(dict)
     channel_activated = Signal(dict, int, str)
+    disconnect_requested = Signal(dict)
     message = Signal(str)
 
     def __init__(self, parent=None):
@@ -9241,6 +9340,7 @@ class DatabasePanel(QWidget):
         self._device_items = {}
         self._title_threads = []
         self._loading = set()
+        self._connected_identity = None
 
         self.title_label = QLabel(tr("Devices"))
         title_font = self.title_label.font()
@@ -9258,11 +9358,29 @@ class DatabasePanel(QWidget):
         self.configure_button.setToolTip(tr("Database connection"))
         self.configure_button.clicked.connect(self.configure)
 
+        self.refresh_button = QToolButton()
+        self.refresh_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.refresh_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.refresh_button.setIconSize(QSize(16, 16))
+        self.refresh_button.setFixedSize(24, 24)
+        self.refresh_button.setAutoRaise(True)
+        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_button.setToolTip(tr("Reload database contents"))
+        self.refresh_button.clicked.connect(self.refresh)
+
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.addWidget(self.title_label)
         header.addStretch(1)
+        header.addWidget(self.refresh_button)
         header.addWidget(self.configure_button)
+
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.setPlaceholderText(tr("Filter devices..."))
+        self.filter_edit.textChanged.connect(self._apply_filter)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(1)
@@ -9285,6 +9403,7 @@ class DatabasePanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.addLayout(header)
+        layout.addWidget(self.filter_edit)
         layout.addWidget(self.tree, 1)
         layout.addWidget(self.status_label)
 
@@ -9349,6 +9468,8 @@ class DatabasePanel(QWidget):
     def retranslate(self):
         self.title_label.setText(tr("Devices"))
         self.configure_button.setToolTip(tr("Database connection"))
+        self.refresh_button.setToolTip(tr("Reload database contents"))
+        self.filter_edit.setPlaceholderText(tr("Filter devices..."))
         for identity, item in self._device_items.items():
             titles = self._channel_titles.get(identity) or []
             for index in range(item.childCount()):
@@ -9416,31 +9537,70 @@ class DatabasePanel(QWidget):
         self._populate()
         self.message.emit(tr("Database loaded."))
 
+    @staticmethod
+    def _device_label(device):
+        return str(device.get("name")
+                   or device.get("host_raw")
+                   or device.get("ip")
+                   or device.get("cloud_id") or "")
+
+    @classmethod
+    def _device_search_text(cls, device):
+        values = []
+        for key in ("area", "name", "host_raw", "ip", "cloud_id",
+                    "description"):
+            value = str(device.get(key) or "").strip()
+            if value:
+                values.append(value)
+        return " ".join(values).casefold()
+
+    def _apply_filter(self, *_):
+        query = self.filter_edit.text().strip().casefold()
+        for group_index in range(self.tree.topLevelItemCount()):
+            group = self.tree.topLevelItem(group_index)
+            visible = False
+            for child_index in range(group.childCount()):
+                child = group.child(child_index)
+                device = child.data(0, Qt.ItemDataRole.UserRole)
+                matches = (
+                    not query
+                    or (isinstance(device, dict)
+                        and query in self._device_search_text(device)))
+                child.setHidden(not matches)
+                visible = visible or matches
+            group.setHidden(not visible)
+            if query and visible:
+                group.setExpanded(True)
+
     def _populate(self):
         self.tree.clear()
         self._device_items = {}
-        groups = {}
+        ungrouped = tr("Ungrouped")
+        grouped = {}
         for device in self._devices:
-            area = str(device.get("area") or "").strip() or tr("Ungrouped")
-            group = groups.get(area)
-            if group is None:
-                group = QTreeWidgetItem([area])
-                font = group.font(0)
-                font.setBold(True)
-                group.setFont(0, font)
-                self.tree.addTopLevelItem(group)
-                groups[area] = group
-            name = str(device.get("name")
-                       or device.get("host_raw")
-                       or device.get("ip")
-                       or device.get("cloud_id") or "")
-            item = QTreeWidgetItem([name])
-            item.setData(0, Qt.ItemDataRole.UserRole, device)
-            item.setToolTip(0, self._device_tooltip(device))
-            group.addChild(item)
-            self._device_items[DeviceTableModel.identity(device)] = item
-        for group in groups.values():
+            area = str(device.get("area") or "").strip() or ungrouped
+            grouped.setdefault(area, []).append(device)
+        for area in sorted(
+                grouped, key=lambda name: (name == ungrouped, name.casefold())):
+            group = QTreeWidgetItem([area])
+            font = group.font(0)
+            font.setBold(True)
+            group.setFont(0, font)
+            self.tree.addTopLevelItem(group)
+            devices = sorted(
+                grouped[area],
+                key=lambda device: (
+                    self._device_label(device).casefold(),
+                    str(device.get("host_raw") or device.get("ip")
+                        or device.get("cloud_id") or "").casefold()))
+            for device in devices:
+                item = QTreeWidgetItem([self._device_label(device)])
+                item.setData(0, Qt.ItemDataRole.UserRole, device)
+                item.setToolTip(0, self._device_tooltip(device))
+                group.addChild(item)
+                self._device_items[DeviceTableModel.identity(device)] = item
             group.setExpanded(True)
+        self._apply_filter()
         self._update_status()
 
     @staticmethod
@@ -9555,6 +9715,21 @@ class DatabasePanel(QWidget):
             return []
         return [str(item or "").strip() for item in value]
 
+    def set_connected(self, identity):
+        self._connected_identity = identity
+
+    def collapse_device(self, identity):
+        item = self._device_items.get(identity)
+        if item is not None:
+            item.takeChildren()
+            item.setExpanded(False)
+        self._channel_counts.pop(identity, None)
+        self._channel_titles.pop(identity, None)
+        self._titles_ready.discard(identity)
+        self._loading.discard(identity)
+        if self._connected_identity == identity:
+            self._connected_identity = None
+
     def begin_connect(self, identity):
         self._loading.add(identity)
         item = self._device_items.get(identity)
@@ -9638,10 +9813,23 @@ class DatabasePanel(QWidget):
             rename = menu.addAction(tr("Rename"))
             rename.triggered.connect(
                 lambda: self._rename_channel(item, device, channel))
+            if (self._connected_identity
+                    == DeviceTableModel.identity(device)):
+                menu.addSeparator()
+                disconnect = menu.addAction(tr("Disconnect"))
+                disconnect.triggered.connect(
+                    lambda: self.disconnect_requested.emit(dict(device)))
         else:
+            identity = DeviceTableModel.identity(data)
+            connected = self._connected_identity == identity
             connect = menu.addAction(tr("Connect"))
+            connect.setEnabled(not connected)
             connect.triggered.connect(
                 lambda: self.device_activated.emit(dict(data)))
+            disconnect = menu.addAction(tr("Disconnect"))
+            disconnect.setEnabled(connected)
+            disconnect.triggered.connect(
+                lambda: self.disconnect_requested.emit(dict(data)))
             copy_action = menu.addAction(tr("Copy address"))
             copy_action.triggered.connect(
                 lambda: QApplication.clipboard().setText(
@@ -9846,6 +10034,7 @@ class MainWindow(QMainWindow):
             (index for index, (_title, key) in enumerate(
                 DeviceTableModel.COLUMNS) if key == "host_name"),
             len(DeviceTableModel.COLUMNS) - 1)
+        self.table.setItemDelegate(ConnectedRowDelegate(self.table))
         self.table.setItemDelegateForColumn(
             self._host_name_column, DeviceProgressDelegate(self.table))
         self.header.toggled.connect(self._set_all_checked_filtered)
@@ -9948,6 +10137,8 @@ class MainWindow(QMainWindow):
         self.db_panel = DatabasePanel(self)
         self.db_panel.device_activated.connect(self._connect_database_device)
         self.db_panel.channel_activated.connect(self._play_database_channel)
+        self.db_panel.disconnect_requested.connect(
+            self._disconnect_database_device)
         self.db_panel.message.connect(self._message)
         self.table_stack = QStackedWidget()
         self.table_stack.addWidget(self.table)
@@ -11539,6 +11730,15 @@ class MainWindow(QMainWindow):
         self._message("NETIP video: %s %s channel %d" % (
             label, stream, channel))
 
+    def _disconnect_database_device(self, device):
+        if not isinstance(device, dict):
+            return
+        identity = DeviceTableModel.identity(device)
+        if self._connected_identity == identity:
+            self._disconnect_device()
+        else:
+            self._message("Device is not connected.")
+
     def _connect_database_device(self, device):
         if not isinstance(device, dict):
             return
@@ -11548,6 +11748,9 @@ class MainWindow(QMainWindow):
             self._message("Database device has no host.")
             return
         identity = DeviceTableModel.identity(device)
+        if self._connected_identity == identity:
+            self._disconnect_device()
+            return
         self.db_panel.begin_connect(identity)
         self.model.upsert(device)
         row = next(
@@ -12382,6 +12585,8 @@ class MainWindow(QMainWindow):
         self._netip_queue.clear()
         self._cancel_netip_thread()
         self._stop_session()
+        self.db_panel.collapse_device(identity)
+        self.db_panel.set_connected(None)
         self.model.set_connected(identity, False)
         self._connected_identity = None
         self._connect_pending = None
@@ -12481,6 +12686,7 @@ class MainWindow(QMainWindow):
         if previous is not None and previous != identity:
             self.model.set_connected(previous, False)
         self._connected_identity = identity
+        self.db_panel.set_connected(identity)
         self.model.set_connected(identity, True)
         self._fetched_keys = set()
         self._fetched_payload = None
@@ -15078,6 +15284,14 @@ class MainWindow(QMainWindow):
         copy_action.setEnabled(bool(text))
         copy_action.triggered.connect(
             lambda: QApplication.clipboard().setText(text))
+        device = (self.model.device_at(index.row())
+                  if index.isValid() else self._selected_device())
+        connected = (
+            isinstance(device, dict)
+            and self._connected_identity == DeviceTableModel.identity(device))
+        disconnect = menu.addAction("Disconnect")
+        disconnect.setEnabled(connected)
+        disconnect.triggered.connect(self._disconnect_device)
         menu.addSeparator()
         menu.addAction(
             "Select all", lambda: self._set_all_checked_filtered(True))
@@ -15089,6 +15303,22 @@ class MainWindow(QMainWindow):
         menu.addAction("Delete", self._delete_device)
         menu.addAction("Clear", self._clear_devices)
         menu.exec(self.table.viewport().mapToGlobal(point))
+
+    def _dialog_device_target(self, dialog):
+        cloud = dialog.cloud_id()
+        kind = device_host_kind(cloud)
+        if kind == "sn":
+            if not cloud_patch_available():
+                self._message("Cloud/SN transport is not available.")
+                return None
+            return cloud, "", bool(dialog.rps()), kind
+        if kind in ("ip", "domain"):
+            return "", cloud, False, kind
+        address = dialog.address()
+        if not address:
+            self._message("Invalid IP address or host.")
+            return None
+        return "", address, False, kind
 
     def _modify_device(self):
         rows = self.table.selectionModel().selectedRows()
@@ -15104,15 +15334,14 @@ class MainWindow(QMainWindow):
         dialog.set_values(device)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        cloud_id = dialog.cloud_id()
-        address = dialog.address() if not cloud_id else ""
-        if not address and not cloud_id:
-            self._message("Invalid IP address.")
+        target = self._dialog_device_target(dialog)
+        if target is None:
             return
+        cloud_id, address, rps, _kind = target
         identity = DeviceTableModel.identity(device)
         updated = manual_device(
             address, dialog.port(), dialog.username(), dialog.password(),
-            cloud_id=cloud_id, rps=dialog.rps())
+            cloud_id=cloud_id, rps=rps)
         updated["no_md5"] = dialog.no_md5()
         for key in ("sn", "mac", "raw", "http_port", "subnet", "gateway"):
             if device.get(key):
@@ -15206,20 +15435,21 @@ class MainWindow(QMainWindow):
         dialog.set_password(self.password_edit.text())
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        cloud_id = dialog.cloud_id()
-        address = dialog.address() if not cloud_id else ""
-        if not address and not cloud_id:
-            self._message("Invalid IP address.")
+        target = self._dialog_device_target(dialog)
+        if target is None:
             return
+        cloud_id, address, rps, kind = target
         device = manual_device(
             address, dialog.port(), dialog.username(), dialog.password(),
-            cloud_id=cloud_id, rps=dialog.rps())
+            cloud_id=cloud_id, rps=rps)
         device["no_md5"] = dialog.no_md5()
         self.model.upsert(device)
-        if cloud_id:
-            self._message("Added cloud device %s:%d" % (cloud_id, device["tcp_port"]))
+        if kind == "sn":
+            self._message("Added cloud device %s:%d" % (
+                cloud_id, device["tcp_port"]))
         else:
-            self._message("Added %s:%d" % (address, device["tcp_port"]))
+            self._message("Added host %s:%d" % (
+                address, device["tcp_port"]))
 
     def _export_devices(self):
         devices = self.model.devices()

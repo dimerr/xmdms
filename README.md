@@ -23,13 +23,16 @@ single PySide6 UI.
 - Device table with IP, MAC, serial number, firmware version, build date and
   host name. Columns are sortable (IP by default) and have a per-column filter
   row; select all/deselect all applies to the matching rows while filters are
-  active. Rows are selectable with checkboxes.
+  active. Rows are selectable with checkboxes; the connected device row stays
+  green until it is disconnected.
 - Search again removes devices that no longer answer, while manual entries are
   kept.
 - Double-click a row to connect. Right-click for copy, select all/deselect all,
   add, modify, delete and clear.
-- Add devices manually by IP address and port, with per-device login and
-  password.
+- Add devices manually by IP address or hostname and port, with per-device
+  login and password. The CloudID field accepts a serial number, domain name or
+  IP address; serials use cloud transport, while domains and IPs connect
+  directly. The same host on different ports is kept as a separate device.
 - Export the current inventory to CSV.
 - Optional SQLite/MySQL device directory with area grouping, field mapping,
   hidden-device filtering, CMS password decryption, RPS cloud IDs and channel
@@ -78,7 +81,10 @@ the status bar **Cancel** button stops the current and queued operations.
   return to the grid.
 - The database device sidebar remembers whether it was open and its width.
   It extends the window to the left, keeping the device table width unchanged,
-  and moves with the window as part of the same window.
+  and moves with the window as part of the same window. It has a reload button
+  and a quick filter, and lists areas alphabetically with devices sorted inside
+  each area. Double-click or use the context menu to connect; doing it again on
+  a connected device disconnects it and collapses its channel tree.
 - Video decoding through QtMultimedia/FFmpeg by default, with optional PyAV or
   a system `ffmpeg` fallback. Set `XMDM_VIDEO_BACKEND=qt|av|ffmpeg` to force a
   backend.
@@ -102,7 +108,9 @@ the status bar **Cancel** button stops the current and queued operations.
 - Build an XM recovery image (`.img`) or a flat flash dump (`.dump`) from an
   XM firmware `.bin` package for offline recovery work. Dumps can include a
   crypto blob at a chosen offset (default `0x2FC00`) or immediately before a
-  detected u-boot environment partition.
+  detected u-boot environment partition. A 1024-byte crypto blob that does not
+  start with the expected `D2 D4` signature is normalized by subtracting 9
+  from every byte.
 - Inspect raw NETIP request/response traffic in the **Query console**.
 - Synchronize device time, reboot devices and change passwords.
 

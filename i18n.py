@@ -28,6 +28,8 @@ RU = {
     "Devices": "Устройства",
     "Toggle database devices panel": "Панель устройств из базы данных",
     "Database connection": "Подключение к базе данных",
+    "Reload database contents": "Перезагрузить содержимое базы данных",
+    "Filter devices...": "Фильтр устройств...",
     "Device": "Устройство",
     "Address": "Адрес",
     "Configure": "Настроить",
@@ -49,6 +51,7 @@ RU = {
     "Hidden:": "Скрыто:",
     "(none)": "(нет)",
     "Connect": "Подключить",
+    "Disconnect": "Отключить",
     "Connected.": "Подключено.",
     "No tables found.": "Таблицы не найдены.",
     "Select a database and press Connect.":
@@ -367,6 +370,13 @@ RU = {
     "IP address:": "IP-адрес:",
     "Subnet mask:": "Маска подсети:",
     "Login:": "Логин:",
+    "CloudID / host:": "CloudID / хост:",
+    "SN, domain or IP; overrides IP": "SN, домен или IP; переопределяет IP",
+    "xmcloud.py not available — SN transport disabled; domains and IPs still connect directly":
+        "xmcloud.py недоступен — транспорт SN отключён; домены и IP подключаются напрямую",
+    "Cloud/SN transport is not available.":
+        "Транспорт Cloud/SN недоступен.",
+    "Invalid IP address or host.": "Неверный IP-адрес или хост.",
     "Transport:": "Транспорт:",
     "Search type:": "Тип поиска:",
     "Provision IP": "Назначить IP",
