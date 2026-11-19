@@ -164,6 +164,8 @@ RU = {
     "Settings": "Настройки",
     "About": "О программе",
     "Check for updates": "Проверить обновления",
+    "Open release": "Открыть выпуск",
+    "View commit": "Открыть коммит",
     "Not checked": "Не проверялось",
     "Checking for updates...": "Проверка обновлений...",
     "No release notes.": "Нет списка изменений.",

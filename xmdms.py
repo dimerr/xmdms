@@ -272,6 +272,15 @@ SET_TIMEOUT = 3.0
 MAX_PARALLEL_UPLOADS = 4
 CONNECTED_BRUSH = QBrush(QColor("#43A047"))
 CONNECTED_TEXT = QColor("#10240F")
+STATUS_ERROR_STYLE = (
+    "background-color: #C62828; color: white;"
+    " border-radius: 3px; padding: 1px 4px;")
+CONNECTION_GREEN_STYLE = (
+    "background-color: #2E7D32; color: white;"
+    " border-radius: 3px; padding: 1px 5px;")
+CONNECTION_RED_STYLE = (
+    "background-color: #C62828; color: white;"
+    " border-radius: 3px; padding: 1px 5px;")
 PROVISION_OK_BRUSH = QBrush(QColor("#A5D6A7"))
 PROVISION_FAILED_BRUSH = QBrush(QColor("#EF9A9A"))
 PROVISION_ACTIVE_BRUSH = QBrush(QColor("#FFF59D"))
@@ -3494,6 +3503,9 @@ class DeviceTableModel(QAbstractTableModel):
             return self._devices[row]
         return None
 
+    def row_for_identity(self, identity):
+        return self._rows.get(identity, -1)
+
     def checked_state(self):
         total = len(self._devices)
         if total == 0:
@@ -3583,7 +3595,7 @@ class DeviceTableModel(QAbstractTableModel):
         device["ip"] = address
         raw = device.get("raw")
         if isinstance(raw, dict) and "HostIP" in raw:
-            raw["HostIP"] = address
+            raw["HostIP"] = format_ip_set(address)
         new_identity = self.identity(device)
         if new_identity != old_identity:
             row = self._rows.pop(old_identity, None)
@@ -3711,6 +3723,8 @@ class DeviceProgressDelegate(ConnectedRowDelegate):
 
 
 class IpAddressEdit(QWidget):
+    changed = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
@@ -3760,9 +3774,11 @@ class IpAddressEdit(QWidget):
 
     def _on_text_changed(self, index, text):
         if index >= 3 or not text.isdigit():
+            self.changed.emit()
             return
         if len(text) == 3 or (len(text) == 2 and int(text) > 25):
             self._focus_octet(index + 1)
+        self.changed.emit()
 
     def value(self):
         parts = []
@@ -10028,7 +10044,7 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeader(self.header)
         self.table.sortByColumn(2, Qt.SortOrder.AscendingOrder)
         self.header.setSectionsClickable(True)
-        self.header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.header.setStretchLastSection(True)
         self._host_name_column = next(
             (index for index, (_title, key) in enumerate(
@@ -10157,6 +10173,11 @@ class MainWindow(QMainWindow):
         self.network_address_edit = IpAddressEdit()
         self.network_submask_edit = IpAddressEdit()
         self.network_gateway_edit = IpAddressEdit()
+        self._gateway_manual = False
+        self.network_address_edit.changed.connect(self._network_ip_changed)
+        self.network_submask_edit.changed.connect(self._network_mask_changed)
+        self.network_gateway_edit.changed.connect(
+            self._network_gateway_changed)
         self.network_dns1_edit = IpAddressEdit()
         self.network_dns2_edit = IpAddressEdit()
         self.network_default_ip_button = QPushButton("Default IP")
@@ -10516,10 +10537,15 @@ class MainWindow(QMainWindow):
         if BUILD_DATE:
             self.about_version_label.setToolTip(
                 "Build date: %s" % BUILD_DATE)
+        self._update_url = ""
+        self.about_update_button = QPushButton("Open release")
+        self.about_update_button.setVisible(False)
+        self.about_update_button.clicked.connect(self._open_update_link)
         self.about_check_button = QPushButton("Check for updates")
         self.about_check_button.clicked.connect(self._check_updates)
         version_row.addWidget(self.about_version_label)
         version_row.addStretch(1)
+        version_row.addWidget(self.about_update_button)
         version_row.addWidget(self.about_check_button)
         about_layout.addLayout(version_row)
         self.about_status_label = QLabel(tr("Not checked"))
@@ -11416,11 +11442,16 @@ class MainWindow(QMainWindow):
             "_i18n_label_source", "Disconnected")
         self.connection_label.setProperty(
             "_i18n_label_last", tr("Disconnected"))
+        self.connection_label.setStyleSheet(CONNECTION_RED_STYLE)
         self.fetch_label = QLabel("")
         self.fetch_label.setProperty("i18nDynamic", True)
         self.netip_cancel_button = QPushButton("Cancel")
         self.netip_cancel_button.setToolTip(
             "Cancel the current and queued NetIP operations.")
+        self.netip_cancel_button.setFixedHeight(
+            max(18, self.fetch_label.sizeHint().height()))
+        self.netip_cancel_button.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.netip_cancel_button.setVisible(False)
         self.netip_cancel_button.clicked.connect(self._cancel_system_actions)
         for label in (self.fetch_label, self.status_label, self.video_status_label):
@@ -11546,8 +11577,26 @@ class MainWindow(QMainWindow):
         if hasattr(self, "filter_table"):
             QTimer.singleShot(0, self._sync_filter_columns)
 
-    def _message(self, text):
+    @staticmethod
+    def _message_is_error(text):
+        lower = str(text or "").casefold()
+        if not lower:
+            return False
+        lower = re.sub(r"\b0\s+(?:failed|errors?)\b", "", lower)
+        hints = (
+            "error", "failed", "failure", "cannot ", "can't ", "invalid ",
+            "unreachable", "refused", "timed out", "timeout", "no response",
+            "not available", "denied", "not connected", "lost",
+        )
+        return any(hint in lower for hint in hints)
+
+    def _set_fetch_text(self, text):
         self.fetch_label.setText(tr(text))
+        self.fetch_label.setStyleSheet(
+            STATUS_ERROR_STYLE if self._message_is_error(text) else "")
+
+    def _message(self, text):
+        self._set_fetch_text(text)
 
     def _on_video_status(self, text):
         self.video_status_label.setText(text)
@@ -11972,10 +12021,60 @@ class MainWindow(QMainWindow):
         self._message("Wi-Fi %s: %s / %s" % (
             ssid, entry.get("Auth") or "?", entry.get("EncrypType") or "?"))
 
+    @staticmethod
+    def _gateway_for_subnet(ip, mask, gateway):
+        """Move the gateway network bits to match a new IP/subnet."""
+        try:
+            ip_value = int(ipaddress.IPv4Address(str(ip or "").strip()))
+            mask_value = int(ipaddress.IPv4Address(str(mask or "").strip()))
+            gateway_value = int(
+                ipaddress.IPv4Address(str(gateway or "").strip()))
+        except (ipaddress.AddressValueError, ValueError):
+            return ""
+        host_mask = ~mask_value & 0xFFFFFFFF
+        value = (gateway_value & host_mask) | (ip_value & mask_value)
+        return str(ipaddress.IPv4Address(value))
+
+    @classmethod
+    def _gateway_in_subnet(cls, ip, mask, gateway):
+        try:
+            ip_value = int(ipaddress.IPv4Address(str(ip or "").strip()))
+            mask_value = int(ipaddress.IPv4Address(str(mask or "").strip()))
+            gateway_value = int(
+                ipaddress.IPv4Address(str(gateway or "").strip()))
+        except (ipaddress.AddressValueError, ValueError):
+            return False
+        return (ip_value & mask_value) == (gateway_value & mask_value)
+
+    def _reset_gateway_helper(self):
+        self._gateway_manual = not self._gateway_in_subnet(
+            self.network_address_edit.value(),
+            self.network_submask_edit.value(),
+            self.network_gateway_edit.value())
+
+    def _network_ip_changed(self):
+        if self._gateway_manual:
+            return
+        gateway = self._gateway_for_subnet(
+            self.network_address_edit.value(),
+            self.network_submask_edit.value(),
+            self.network_gateway_edit.value())
+        if gateway and gateway != self.network_gateway_edit.value():
+            self.network_gateway_edit.setValue(gateway)
+
+    def _network_mask_changed(self):
+        if self._gateway_manual:
+            return
+        self._network_ip_changed()
+
+    def _network_gateway_changed(self):
+        self._gateway_manual = True
+
     def _set_default_ip(self):
         self.network_address_edit.setValue("192.168.1.10")
         self.network_submask_edit.setValue("255.255.255.0")
         self.network_gateway_edit.setValue("192.168.1.1")
+        self._reset_gateway_helper()
 
     def _set_default_dns(self):
         self.network_dns1_edit.setValue("77.88.8.8")
@@ -11989,6 +12088,7 @@ class MainWindow(QMainWindow):
         self.network_address_edit.setValue(device.get("ip") or "")
         self.network_submask_edit.setValue(device.get("subnet") or "")
         self.network_gateway_edit.setValue(device.get("gateway") or "")
+        self._reset_gateway_helper()
         self.network_dns1_edit.setValue(format_ipv4(raw.get("DNS1") or raw.get("Dns1")))
         self.network_dns2_edit.setValue(format_ipv4(raw.get("DNS2") or raw.get("Dns2")))
         self.network_adaptive_check.setChecked(bool(raw.get("IPAdaptive")))
@@ -12022,6 +12122,7 @@ class MainWindow(QMainWindow):
                     self.network_transfer_combo.addItem(transfer)
                 self.network_transfer_combo.setCurrentText(transfer)
             self.network_hsdownload_check.setChecked(bool(common.get("UseHSDownLoad")))
+            self._reset_gateway_helper()
         if isinstance(dns, dict) and dns:
             self.network_dns1_edit.setValue(format_ipv4(
                 dns.get("Address") or dns.get("DNS1") or dns.get("Dns1")))
@@ -12491,6 +12592,7 @@ class MainWindow(QMainWindow):
         if gateway:
             self.network_gateway_edit.setValue(gateway)
             enabled.append(self.network_gateway_edit)
+        self._reset_gateway_helper()
         http_port = device.get("http_port") or raw.get("HttpPort")
         if http_port:
             self.network_http_edit.setText(str(http_port))
@@ -12564,6 +12666,9 @@ class MainWindow(QMainWindow):
         self.connection_label.setProperty("_i18n_label_source", source)
         self.connection_label.setProperty("_i18n_label_last", tr(source))
         self.connection_label.setText(tr(source))
+        connected = str(source or "").startswith("Connected")
+        self.connection_label.setStyleSheet(
+            CONNECTION_GREEN_STYLE if connected else CONNECTION_RED_STYLE)
 
     def _reset_fetched_configs(self):
         self._system_payload = None
@@ -12767,7 +12872,7 @@ class MainWindow(QMainWindow):
         sender = self.sender()
         if isinstance(sender, NetipThread) and sender is not self._netip_thread:
             return
-        self.fetch_label.setText(tr(text))
+        self._set_fetch_text(text)
 
     @staticmethod
     def _save_setting(key, value):
@@ -12790,6 +12895,18 @@ class MainWindow(QMainWindow):
                 and not self._updates_checked):
             self._updates_checked = True
             self._check_updates()
+
+    def _open_update_link(self):
+        if self._update_url:
+            QDesktopServices.openUrl(QUrl(self._update_url))
+
+    def _set_update_link(self, url, label):
+        self._update_url = str(url or "").strip()
+        if self._update_url:
+            self.about_update_button.setText(tr(label))
+            self.about_update_button.setVisible(True)
+        else:
+            self.about_update_button.setVisible(False)
 
     def _check_updates(self):
         if self._release_thread is not None:
@@ -12815,13 +12932,16 @@ class MainWindow(QMainWindow):
     def _render_about_state(self):
         kind, payload = self._about_state
         if kind == "checking":
+            self._set_update_link("", "")
             self.about_status_label.setText(tr("Checking for updates..."))
         elif kind == "error":
+            self._set_update_link("", "")
             self.about_status_label.setText(
                 tr("Update check failed: ") + tr(payload))
         elif kind == "result":
             self._render_update_result(payload)
         else:
+            self._set_update_link("", "")
             self.about_status_label.setText(tr("Not checked"))
 
     def _on_update_error(self, text):
@@ -12835,13 +12955,17 @@ class MainWindow(QMainWindow):
         if kind == "release":
             tag = str(data.get("tag") or "")
             title = str(data.get("name") or tag)
-            if version_key(tag) > version_key(APP_VERSION):
+            available = version_key(tag) > version_key(APP_VERSION)
+            if available:
                 status = "%s %s (%s %s)" % (
                     tr("Update available:"), tag,
                     tr("current"), APP_VERSION)
             else:
                 status = "%s %s" % (tr("Up to date — latest"), tag)
             self.about_status_label.setText(status)
+            self._set_update_link(
+                str(data.get("url") or "") if available else "",
+                "Open release")
             body = str(data.get("body") or "").strip()
             if not body:
                 body = tr("No release notes.")
@@ -12856,11 +12980,13 @@ class MainWindow(QMainWindow):
             sha = str(data.get("sha") or "")
             short = sha[:7]
             branch = str(data.get("branch") or "main")
+            newer = False
             if BUILD_COMMIT and sha.lower().startswith(
                     BUILD_COMMIT.lower()):
                 status = "%s %s" % (tr("Up to date — latest commit"), short)
             elif BUILD_COMMIT and remote_is_newer(
                     data.get("date"), BUILD_TIMESTAMP or BUILD_DATE):
+                newer = True
                 status = "%s %s (%s)" % (
                     tr("New commits available on"), branch, short)
             elif BUILD_COMMIT:
@@ -12868,6 +12994,9 @@ class MainWindow(QMainWindow):
             else:
                 status = "%s %s" % (tr("Latest commit:"), short or "?")
             self.about_status_label.setText(status)
+            self._set_update_link(
+                str(data.get("url") or "") if newer else "",
+                "View commit")
             message = str(data.get("message") or "").strip()
             if not message:
                 message = tr("No commit message.")
@@ -13008,7 +13137,7 @@ class MainWindow(QMainWindow):
         if thread is not None:
             thread.cancel()
             self._stale_threads.append(thread)
-        self.fetch_label.setText("")
+        self._set_fetch_text("")
         self._set_system_busy(False)
         self._update_encode_table_button()
         self._update_camera_table_button()
@@ -15328,7 +15457,7 @@ class MainWindow(QMainWindow):
         if thread is not None:
             if (getattr(thread, "_action", "") == "fetch"
                     and not self._system_error):
-                self.fetch_label.setText("")
+                self._set_fetch_text("")
             thread.deleteLater()
         self._system_error = False
         self._set_system_busy(False)
@@ -15715,9 +15844,23 @@ class MainWindow(QMainWindow):
     def _on_number_result(self, identity, ip, message):
         if message.get("Ret") == 100:
             self._number_done += 1
+            selected = self._selected_device()
+            selected_identity = (
+                DeviceTableModel.identity(selected)
+                if selected is not None else None)
+            old_identity = identity
             device = self._number_device_map.get(identity)
             if device is not None:
+                if old_identity == self._connected_identity:
+                    if self.video_panel.is_active():
+                        self._stop_video()
+                    self._drop_connection(
+                        "IP changed to %s — reconnect to the new address" % ip)
                 identity = self.model.set_device_ip(device, ip)
+                if selected_identity == old_identity:
+                    row = self.model.row_for_identity(identity)
+                    if row >= 0:
+                        self.table.selectRow(row)
             self.model.set_provision_state(identity, "ok")
             self._message("Numbering %s: OK" % ip)
         else:
@@ -16011,7 +16154,7 @@ class MainWindow(QMainWindow):
             self._resume_search()
             return
         device, address, submask, gateway = pending
-        self._ipset_target = (device, address)
+        self._ipset_target = (device, address, submask, gateway)
         interface = self.interface_combo.currentData()
         if not isinstance(interface, dict):
             interface = {"ip": "", "broadcast": "255.255.255.255"}
@@ -16047,17 +16190,43 @@ class MainWindow(QMainWindow):
         self._ipset_target = None
         if ret != 100 or target is None:
             return
-        device, address = target
-        old_address = str(device.get("ip") or "")
-        if not address or address == old_address:
+        device, address, submask, gateway = target
+        if not address:
             return
-        identity = DeviceTableModel.identity(device)
-        if identity == self._connected_identity:
+        selected = self._selected_device()
+        selected_identity = (
+            DeviceTableModel.identity(selected) if selected is not None else None)
+        old_identity = DeviceTableModel.identity(device)
+        old_address = str(device.get("ip") or "")
+        address_changed = address != old_address
+        if address_changed and old_identity == self._connected_identity:
             if self.video_panel.is_active():
                 self._stop_video()
             self._drop_connection(
                 "IP changed to %s — reconnect to the new address" % address)
-        self.model.set_device_ip(device, address)
+        identity = self.model.set_device_ip(device, address)
+        device["subnet"] = submask or device.get("subnet") or ""
+        device["gateway"] = gateway or device.get("gateway") or ""
+        raw = device.get("raw")
+        if isinstance(raw, dict):
+            if submask:
+                raw["Submask"] = format_ip_set(submask)
+            if gateway:
+                raw["GateWay"] = format_ip_set(gateway)
+        payload = self._fetched_payload
+        common = (payload.get("common")
+                  if isinstance(payload, dict) else None)
+        if isinstance(common, dict):
+            common["HostIP"] = format_ip_set(address)
+            if submask:
+                common["Submask"] = format_ip_set(submask)
+            if gateway:
+                common["GateWay"] = format_ip_set(gateway)
+        row = self.model.row_for_identity(identity)
+        if selected_identity == old_identity and row >= 0:
+            self.table.selectRow(row)
+        if self._selected_device() is device:
+            self._fill_network_fields(device)
 
     def _on_network_failed(self, text):
         self._message("Failed: %s" % text)
