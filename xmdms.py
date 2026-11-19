@@ -1981,14 +1981,18 @@ class NetipThread(QThread):
                                 encode_smart.append({
                                     "mode": "v2",
                                     "config": camera.get_command(
-                                        "AVEnc.SmartH264V2.[%d]" % chn, 1042)})
+                                        "AVEnc.SmartH264V2.[%d]" % chn, 1042),
+                                    "plus": has_v2,
+                                    "legacy": has_v1})
                             elif has_v1:
                                 self.progress.emit(
                                     "Fetching AVEnc.SmartH264.[%d]" % chn)
                                 encode_smart.append({
                                     "mode": "v1",
                                     "config": camera.get_command(
-                                        "AVEnc.SmartH264.[%d]" % chn, 1042)})
+                                        "AVEnc.SmartH264.[%d]" % chn, 1042),
+                                    "plus": False,
+                                    "legacy": has_v1})
                             else:
                                 encode_smart.append(None)
                     def has_valid(values):
@@ -2009,18 +2013,86 @@ class NetipThread(QThread):
                         if want("encode_smart"):
                             has_v2 = bool(smart_v2) and smart_v2[0] == 1
                             has_v1 = bool(smart_v1) and smart_v1[0] == 1
-                            if has_v2 and has_v1:
-                                encode_smart.append({
-                                    "mode": "v2",
-                                    "config": camera.get_command(
-                                        "AVEnc.SmartH264V2.[0]", 1042)})
+                            plus_ability = None
+                            legacy_ability = None
+                            try:
+                                codec_ability = camera.get_command(
+                                    "Encode264ability", 1360)
+                            except Exception:
+                                codec_ability = None
+
+                            def smart_bit(values):
+                                if (isinstance(values, list) and values):
+                                    values = values[0]
+                                try:
+                                    return bool(int(str(values), 0) & 1)
+                                except (TypeError, ValueError):
+                                    return None
+
+                            if isinstance(codec_ability, dict):
+                                plus_ability = smart_bit(
+                                    codec_ability.get("uIntel264Plus"))
+                                legacy_ability = smart_bit(
+                                    codec_ability.get("uIntel264"))
+                            if plus_ability is not None or legacy_ability is not None:
+                                has_v2 = bool(plus_ability)
+                                has_v1 = bool(legacy_ability)
+                            elif not has_v2 and not has_v1:
+                                # Some IPCs do not implement the per-channel
+                                # smart flags, but advertise SmartH264V2 in
+                                # SystemFunction and support AVEnc directly.
+                                try:
+                                    functions = camera.get_command(
+                                        "SystemFunction", 1360)
+                                except Exception:
+                                    functions = None
+                                encode_function = (
+                                    functions.get("EncodeFunction")
+                                    if isinstance(functions, dict) else None)
+                                if isinstance(encode_function, dict):
+                                    has_v2 = bool(
+                                        encode_function.get("SmartH264V2"))
+                                    has_v1 = bool(
+                                        encode_function.get("SmartH264"))
+                            if plus_ability is None and legacy_ability is None:
+                                plus_ability = has_v2
+                                legacy_ability = has_v1
+                            smart_state = None
+                            if has_v2:
+                                self.progress.emit(
+                                    "Fetching AVEnc.SmartH264V2")
+                                try:
+                                    config = camera.get_command(
+                                        "AVEnc.SmartH264V2", 1042)
+                                except Exception:
+                                    config = None
+                                if (isinstance(config, list) and config
+                                        and isinstance(config[0], dict)):
+                                    config = config[0]
+                                if (isinstance(config, dict)
+                                        and "Ret" not in config):
+                                    smart_state = {
+                                        "mode": "v2", "config": config,
+                                        "plus": bool(plus_ability),
+                                        "legacy": bool(legacy_ability)}
                             elif has_v1:
-                                encode_smart.append({
-                                    "mode": "v1",
-                                    "config": camera.get_command(
-                                        "AVEnc.SmartH264.[0]", 1042)})
-                            else:
-                                encode_smart.append(None)
+                                self.progress.emit(
+                                    "Fetching AVEnc.SmartH264")
+                                try:
+                                    config = camera.get_command(
+                                        "AVEnc.SmartH264", 1042)
+                                except Exception:
+                                    config = None
+                                if (isinstance(config, list) and config
+                                        and isinstance(config[0], dict)):
+                                    config = config[0]
+                                if (isinstance(config, dict)
+                                        and "Ret" not in config):
+                                    smart_state = {
+                                        "mode": "v1", "config": config,
+                                        "plus": False,
+                                        "legacy": True}
+                            encode_smart.append(smart_state)
 
                     # Some direct IP cameras report DigChannel=1 but do not
                     # implement NetWork.ChnStatus, leaving camera_param as
@@ -2229,10 +2301,10 @@ class NetipThread(QThread):
                     reply = camera.send(1486, {"Name": values.get("name")})
                 elif action == "user_password":
                     reply = camera.send(1488, {
-                        "EncryptType": "NONE",
+                        "EncryptType": "MD5",
                         "UserName": values.get("name"),
-                        "PassWord": values.get("old") or "",
-                        "NewPassWord": values.get("new") or ""})
+                        "PassWord": sofia_hash(values.get("old") or ""),
+                        "NewPassWord": sofia_hash(values.get("new") or "")})
                 elif action == "group_delete":
                     reply = camera.send(1480, {"Name": values.get("name")})
                 elif action in ("group_add", "group_modify"):
@@ -2259,10 +2331,12 @@ class NetipThread(QThread):
                         or user.get("AuthorityList") or [],
                     })
                     if action == "user_add":
-                        user["Password"] = values.get("password") or ""
+                        user["Password"] = sofia_hash(
+                            values.get("password") or "")
                         user["Reserved"] = False
                         reply = camera.send(1482, {
-                            "Name": "AddUser", "EncryptType": "NONE", "User": user})
+                            "Name": "AddUser", "EncryptType": "MD5",
+                            "User": user})
                     else:
                         reply = camera.send(1484, {
                             "Name": "ModifyUser", "User": user,
@@ -3961,6 +4035,19 @@ class AuthorityListWidget(QListWidget):
         return [self.item(index).text() for index in range(self.count())
                 if self.item(index).checkState() == Qt.CheckState.Checked]
 
+    def set_allowed(self, allowed):
+        allowed = set(allowed)
+        for index in range(self.count()):
+            item = self.item(index)
+            enabled = item.text() in allowed
+            flags = item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            if enabled:
+                flags |= Qt.ItemFlag.ItemIsEnabled
+            else:
+                flags &= ~Qt.ItemFlag.ItemIsEnabled
+                item.setCheckState(Qt.CheckState.Unchecked)
+            item.setFlags(flags)
+
 
 class UserDialog(QDialog):
     def __init__(self, parent=None, groups=(), authorities=(), user=None):
@@ -3968,10 +4055,13 @@ class UserDialog(QDialog):
         self.setWindowTitle("Modify user" if user else "Add user")
         self._adding = user is None
         self.name_edit = QLineEdit()
+        self.name_edit.setMaxLength(16)
         self.sharable_check = QCheckBox("Reuseable")
         self.password_edit = QLineEdit()
+        self.password_edit.setMaxLength(64)
         configure_password_edit(self.password_edit)
         self.confirm_edit = QLineEdit()
+        self.confirm_edit.setMaxLength(64)
         configure_password_edit(self.confirm_edit)
         self.group_combo = QComboBox()
         self._group_authorities = {}
@@ -4033,19 +4123,21 @@ class UserDialog(QDialog):
             if index >= 0:
                 self.group_combo.setCurrentIndex(index)
             self.memo_edit.setText(str(user.get("Memo") or ""))
+        self._group_changed(self.group_combo.currentText())
 
     def _set_all(self, state):
         for index in range(self.authority_list.count()):
             self.authority_list.item(index).setCheckState(state)
 
     def _group_changed(self, name):
+        allowed = set(self._group_authorities.get(name, ()))
+        self.authority_list.set_allowed(allowed)
         if not self._adding:
             return
-        checked = set(self._group_authorities.get(name, ()))
         for index in range(self.authority_list.count()):
             item = self.authority_list.item(index)
             item.setCheckState(
-                Qt.CheckState.Checked if item.text() in checked
+                Qt.CheckState.Checked if item.text() in allowed
                 else Qt.CheckState.Unchecked)
 
     def values(self):
@@ -4185,15 +4277,30 @@ class EncodeTableDialog(QDialog):
                 gop.setRange(1, 250)
                 fields[prefix + "_gop"] = gop
             mode = smart_state.get("mode") if isinstance(smart_state, dict) else None
-            for key in ("m_smart", "s_smart"):
+            plus_enabled = (
+                bool(smart_state.get("plus", True))
+                if isinstance(smart_state, dict) else False)
+            legacy_enabled = (
+                bool(smart_state.get("legacy", True))
+                if isinstance(smart_state, dict) else False)
+            for prefix, format_key in (("m", "MainFormat"),
+                                       ("s", "ExtraFormat")):
+                fmt = entry.get(format_key) if isinstance(entry, dict) else None
+                video = (fmt.get("Video")
+                         if isinstance(fmt, dict) else None)
+                is_h265 = "265" in str(
+                    (video or {}).get("Compression") or "").upper()
                 smart = QComboBox()
+                smart.addItem("Off", "Off")
+                legacy_label = "H265+" if is_h265 else "H264+"
                 if mode == "v2":
-                    smart.addItems(["Off", "H265+", "H265AI"])
-                elif mode == "v1":
-                    smart.addItems(["Off", "H265+"])
-                else:
-                    smart.addItem("Off")
-                fields[key] = smart
+                    if legacy_enabled:
+                        smart.addItem(legacy_label, "Legacy")
+                    if plus_enabled and is_h265:
+                        smart.addItem("H265AI", "Plus")
+                elif mode == "v1" and legacy_enabled:
+                    smart.addItem(legacy_label, "Legacy")
+                fields[prefix + "_smart"] = smart
             for column, key in enumerate(self.KEYS):
                 table.setCellWidget(chn, column, fields[key])
             self._rows[chn] = fields
@@ -4227,10 +4334,13 @@ class EncodeTableDialog(QDialog):
                             v2_on = (isinstance(v2, list) and index < len(v2)
                                      and isinstance(v2[index], dict)
                                      and v2[index].get("SmartH264"))
-                            value = "H265AI" if plus_on else "H265+" if v2_on else "Off"
+                            value = "Plus" if plus_on else (
+                                "Legacy" if v2_on else "Off")
                         elif config.get("SmartH264"):
-                            value = "H265+"
-                        fields[key].setCurrentText(value)
+                            value = "Legacy"
+                        combo = fields[key]
+                        found = combo.findData(value)
+                        combo.setCurrentIndex(found if found >= 0 else 0)
             for widget in fields.values():
                 widget.setEnabled(enabled)
             self._initial[chn] = {
@@ -4284,8 +4394,9 @@ class EncodeTableDialog(QDialog):
                 editor.setValue(2)
             else:
                 editor = QComboBox()
-                editor.setEditable(True)
-                editor.addItems(["Off", "H265+", "H265AI"])
+                editor.addItem("Off", "Off")
+                editor.addItem("H264+ / H265+", "Legacy")
+                editor.addItem("H265AI", "Plus")
             self._all[key] = editor
             footer.setCellWidget(0, column, editor)
             button = QPushButton("To all")
@@ -4337,9 +4448,16 @@ class EncodeTableDialog(QDialog):
             if not widget.isEnabled():
                 continue
             if isinstance(widget, QComboBox):
-                if widget.findText(editor.currentText()) < 0:
-                    widget.addItem(editor.currentText())
-                widget.setCurrentText(editor.currentText())
+                data = editor.currentData()
+                if data is not None:
+                    index = widget.findData(data)
+                    if index >= 0:
+                        widget.setCurrentIndex(index)
+                else:
+                    text = editor.currentText()
+                    if widget.findText(text) < 0:
+                        widget.addItem(text)
+                    widget.setCurrentText(text)
             else:
                 widget.setValue(editor.value())
 
@@ -4398,7 +4516,9 @@ class EncodeTableDialog(QDialog):
                     if isinstance(config, dict):
                         mode = smart_state.get("mode")
                         for index, key in ((0, "m_smart"), (1, "s_smart")):
-                            value = fields[key].currentText()
+                            value = fields[key].currentData()
+                            if value is None:
+                                value = fields[key].currentText()
                             if mode == "v2":
                                 plus = config.setdefault("Smart264PlusV2", [])
                                 v2 = config.setdefault("Smart264V2", [])
@@ -4408,9 +4528,9 @@ class EncodeTableDialog(QDialog):
                                     v2.append({})
                                 if isinstance(plus[index], dict):
                                     plus[index]["SmartH264Plus"] = (
-                                        1 if value == "H265AI" else 0)
+                                        1 if value == "Plus" else 0)
                                 if isinstance(v2[index], dict):
-                                    v2[index]["SmartH264"] = value == "H265+"
+                                    v2[index]["SmartH264"] = value == "Legacy"
                             elif mode == "v1" and index == 0:
                                 config["SmartH264"] = value != "Off"
                         if mode in ("v1", "v2"):
@@ -10068,8 +10188,14 @@ class MainWindow(QMainWindow):
             "V5.00.R02.00030695",
             "0000-00-00 00:00:00",
         )
+        sn_column = next(
+            (index for index, (_title, key) in enumerate(
+                DeviceTableModel.COLUMNS) if key == "sn"), 4)
         for column, sample in enumerate(measurements, start=1):
-            self.table.setColumnWidth(column, metrics.horizontalAdvance(sample) + 16)
+            width = metrics.horizontalAdvance(sample) + 16
+            if column == sn_column:
+                width += 1
+            self.table.setColumnWidth(column, width)
 
         self.filter_edits = {}
         self.filter_table = QTableWidget(
@@ -13389,6 +13515,9 @@ class MainWindow(QMainWindow):
 
             for key in ("codec", "res", "rc"):
                 fields[key].currentTextChanged.connect(refresh)
+            fields["codec"].currentTextChanged.connect(
+                lambda _text, prefix=prefix:
+                self._encode_refresh_smart(prefix))
             fields["res"].currentTextChanged.connect(
                 self._encode_resolution_changed)
             for key in ("quality", "fps", "gop"):
@@ -13442,6 +13571,62 @@ class MainWindow(QMainWindow):
                 return state
         return None
 
+    def _encode_refresh_smart(self, prefix):
+        chn = self._encode_current
+        if chn is None:
+            return
+        combo = self.encode_widgets[prefix]["smart"]
+        self._encode_populate_smart(
+            prefix, self._encode_smart_state(chn),
+            0 if prefix == "main" else 1, combo.currentData())
+
+    def _encode_populate_smart(self, prefix, smart_state, index,
+                               preferred=None):
+        fields = self.encode_widgets[prefix]
+        mode = smart_state.get("mode") if smart_state else None
+        codec = fields["codec"].currentText().upper()
+        is_h265 = "265" in codec
+        plus_enabled = (
+            bool(smart_state.get("plus", True)) if smart_state else False)
+        legacy_enabled = (
+            bool(smart_state.get("legacy", True)) if smart_state else False)
+        smart_combo = fields["smart"]
+        smart_combo.blockSignals(True)
+        smart_combo.clear()
+        smart_combo.addItem("Off", "Off")
+        legacy_value = "H265+" if is_h265 else "H264+"
+        if mode == "v2":
+            if legacy_enabled:
+                smart_combo.addItem(legacy_value, "H265+")
+            if plus_enabled and is_h265:
+                smart_combo.addItem("H265AI", "H265AI")
+        elif mode == "v1":
+            if legacy_enabled:
+                smart_combo.addItem(legacy_value, legacy_value)
+        value = "Off"
+        if smart_state:
+            config = smart_state.get("config") or {}
+            if mode == "v2":
+                plus = config.get("Smart264PlusV2")
+                entries = config.get("Smart264V2")
+                plus_on = (isinstance(plus, list) and index < len(plus)
+                           and isinstance(plus[index], dict)
+                           and plus[index].get("SmartH264Plus") == 1)
+                v2_on = (isinstance(entries, list) and index < len(entries)
+                         and isinstance(entries[index], dict)
+                         and entries[index].get("SmartH264"))
+                value = "H265AI" if plus_on else "H265+" if v2_on else "Off"
+            elif mode == "v1" and config.get("SmartH264"):
+                value = legacy_value
+        if preferred is not None and smart_combo.findData(preferred) >= 0:
+            value = preferred
+        index_value = smart_combo.findData(value)
+        smart_combo.setCurrentIndex(index_value if index_value >= 0 else 0)
+        smart_combo.blockSignals(False)
+        for widget in fields.values():
+            widget.setEnabled(True)
+        smart_combo.setEnabled(mode is not None and smart_combo.count() > 1)
+
     def _encode_set_stream(self, prefix, fmt, smart_state, index):
         fields = self.encode_widgets[prefix]
         video = fmt.get("Video") if isinstance(fmt.get("Video"), dict) else {}
@@ -13460,36 +13645,7 @@ class MainWindow(QMainWindow):
         fields["rc"].setCurrentText(str(video.get("BitRateControl") or ""))
         fields["video"].setChecked(bool(fmt.get("VideoEnable")))
         fields["audio"].setChecked(bool(fmt.get("AudioEnable")))
-        mode = smart_state.get("mode") if smart_state else None
-        smart_combo = fields["smart"]
-        smart_combo.blockSignals(True)
-        smart_combo.clear()
-        if mode == "v2":
-            smart_combo.addItems(["Off", "H265+", "H265AI"])
-        elif mode == "v1":
-            smart_combo.addItems(["Off", "H265+"])
-        else:
-            smart_combo.addItem("Off")
-        value = "Off"
-        if smart_state:
-            config = smart_state.get("config") or {}
-            if mode == "v2":
-                plus = config.get("Smart264PlusV2")
-                entries = config.get("Smart264V2")
-                plus_on = (isinstance(plus, list) and index < len(plus)
-                           and isinstance(plus[index], dict)
-                           and plus[index].get("SmartH264Plus") == 1)
-                v2_on = (isinstance(entries, list) and index < len(entries)
-                         and isinstance(entries[index], dict)
-                         and entries[index].get("SmartH264"))
-                value = "H265AI" if plus_on else "H265+" if v2_on else "Off"
-            elif mode == "v1" and config.get("SmartH264"):
-                value = "H265+"
-        smart_combo.setCurrentText(value)
-        smart_combo.blockSignals(False)
-        for widget in fields.values():
-            widget.setEnabled(True)
-        smart_combo.setEnabled(mode is not None)
+        self._encode_populate_smart(prefix, smart_state, index)
 
     def _encode_load_channel(self, chn):
         self._encode_current = chn
@@ -13631,7 +13787,9 @@ class MainWindow(QMainWindow):
                 continue
             mode = smart_state.get("mode")
             index = 0 if prefix == "main" else 1
-            value = fields["smart"].currentText()
+            value = fields["smart"].currentData()
+            if value is None:
+                value = fields["smart"].currentText()
             if mode == "v2":
                 plus = config.setdefault("Smart264PlusV2", [])
                 smart = config.setdefault("Smart264V2", [])
@@ -14473,6 +14631,21 @@ class MainWindow(QMainWindow):
                     return authorities
         return []
 
+    def _group_authorities_for(self, name):
+        for group in self._groups:
+            if isinstance(group, dict) and str(group.get("Name")) == name:
+                authorities = group.get("AuthorityList")
+                return set(authorities) if isinstance(authorities, list) else set()
+        return None
+
+    def _filter_user_authorities(self, values):
+        allowed = self._group_authorities_for(values.get("group"))
+        if allowed is not None:
+            values["authority"] = [
+                item for item in values.get("authority") or []
+                if item in allowed]
+        return values
+
     def _user_add(self):
         if not self._groups:
             self._message("No groups available.")
@@ -14480,9 +14653,25 @@ class MainWindow(QMainWindow):
         dialog = UserDialog(self, self._groups, self._authorities)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        values = dialog.values()
+        values = self._filter_user_authorities(dialog.values())
         if not values["name"]:
             self._message("User name is required.")
+            return
+        if len(values["name"]) > 16:
+            self._message("User name is too long (max 16).")
+            return
+        if values["name"].casefold() in (
+                "admin", "administrator", "guest", "root", "system"):
+            self._message("Invalid user name.")
+            return
+        if any(
+                str(user.get("Name") or "").casefold()
+                == values["name"].casefold()
+                for user in self._users if isinstance(user, dict)):
+            self._message("User already exists.")
+            return
+        if not values["password"]:
+            self._message("Password is required.")
             return
         if values["password"] != values["confirm"]:
             self._message("Passwords do not match.")
@@ -14498,7 +14687,7 @@ class MainWindow(QMainWindow):
         dialog = UserDialog(self, self._groups, self._authorities, user=user)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        values = dialog.values()
+        values = self._filter_user_authorities(dialog.values())
         if not values["name"]:
             self._message("User name is required.")
             return

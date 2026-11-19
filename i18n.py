@@ -369,6 +369,13 @@ RU = {
     "Search attempts:": "Попыток поиска:",
     "Theme:": "Тема:",
     "Passwords:": "Пароли:",
+    "User name is required.": "Требуется имя пользователя.",
+    "User name is too long (max 16).":
+        "Имя пользователя слишком длинное (макс. 16).",
+    "Invalid user name.": "Недопустимое имя пользователя.",
+    "User already exists.": "Пользователь уже существует.",
+    "Password is required.": "Требуется пароль.",
+    "Passwords do not match.": "Пароли не совпадают.",
 
     # Dialogs / digital channels
     "Add device": "Добавить устройство",
