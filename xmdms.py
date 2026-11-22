@@ -37,6 +37,7 @@ from PySide6.QtCore import (
     QRectF,
     QSettings,
     QSize,
+    QTime,
     Qt,
     QThread,
     QTimer,
@@ -99,6 +100,7 @@ from PySide6.QtWidgets import (
     QTextBrowser,
     QTableWidgetItem,
     QTabWidget,
+    QTimeEdit,
     QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
@@ -406,7 +408,8 @@ TAB_FETCH_KEYS = (
                  "online_upgrade", "upnp", "onvif_pwd", "pms", "ntp", "pubcfg",
                  "caps", "force_dhcp", "disable_xm_server", "nat", "ability",
                  "oemcfg")),
-    ("System", ("system", "common", "general", "system_timezone", "languages",
+    ("System", ("system", "system_time", "common", "general",
+                "system_timezone", "languages",
                 "max_preview", "ability", "device_desc", "nat_info",
                 "chn_status")),
     ("Display", ("video_out", "gui_set", "vga_resolution", "ability", "device_desc")),
@@ -780,7 +783,8 @@ def load_private_extension(window):
     The file is deliberately not imported statically: PyInstaller never
     collects it, so it cannot leak into a public build.  It is also
     gitignored and local-only.  ``priv.py`` must define
-    ``install(window, app)`` where ``app`` is this running module.
+    ``install(window, app)`` where ``app`` is this running module.  The
+    extension can add its own tabs with ``window.add_tab(...)``.
     """
     path = application_file("priv.py")
     if not path:
@@ -2153,6 +2157,7 @@ class NetipThread(QThread):
                         ("ability", "Ability.FunctionEnable", 1042),
                         ("device_desc", "Ability.DeviceDesc", 1042),
                         ("max_preview", "fVideo.MaxPreviewNum", 1042),
+                        ("system_time", "OPTimeQuery", 1452),
                         ("system_timezone", "System.TimeZone", 1042),
                         ("nat_info", "Status.NatInfo", 1042),
                         ("video_out", "fVideo.VideoOut", 1042),
@@ -2532,6 +2537,18 @@ class NetipThread(QThread):
         if timezone:
             results["System.TimeZone"] = camera.set_command(
                 "System.TimeZone", timezone, 1040)
+        set_time = changes.get("set_time")
+        if set_time:
+            when = None
+            try:
+                when = datetime.strptime(
+                    str(set_time), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+            if when is None:
+                results["SetTime"] = {"Ret": 101, "Tip": "Invalid time"}
+            else:
+                results["SetTime"] = camera.set_time(when)
         device_desc = changes.get("device_desc")
         if device_desc:
             results["Ability.DeviceDesc"] = camera.set_command(
@@ -10091,6 +10108,7 @@ class MainWindow(QMainWindow):
         self._number_attempts = {}
         self._number_device_map = {}
         self._number_interface = {}
+        self._private_tabs = {}
 
         self.model = DeviceTableModel(self)
         self._interfaces = list_interfaces()
@@ -10772,6 +10790,22 @@ class MainWindow(QMainWindow):
         self.display_audio_edit = QLineEdit()
         self.display_audio_edit.setReadOnly(True)
         self._system_device_desc_config = {}
+        self.system_date_edit = QDateEdit()
+        self.system_date_edit.setCalendarPopup(True)
+        self.system_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.system_date_edit.setDate(QDate.currentDate())
+        self.system_date_edit.setMinimumWidth(112)
+        self.system_date_edit.setMaximumWidth(132)
+        self.system_date_edit.setToolTip(
+            "Device date; press Save to apply.")
+        self.system_time_edit = QTimeEdit()
+        self.system_time_edit.setDisplayFormat("HH:mm:ss")
+        self.system_time_edit.setTime(QTime.currentTime())
+        self.system_time_edit.setMinimumWidth(100)
+        self.system_time_edit.setMaximumWidth(120)
+        self.system_time_edit.setToolTip(
+            "Device time; press Save to apply.")
+        self._system_time_initial = self._system_time_fields_value()
         self.system_sync_button = QPushButton("Sync time")
         self.system_sync_button.clicked.connect(self._system_sync_time)
         self.system_channels_button = QPushButton("Digital channels")
@@ -10951,7 +10985,23 @@ class MainWindow(QMainWindow):
 
         left_buttons = QVBoxLayout()
         left_buttons.setSpacing(6)
-        left_buttons.addWidget(self.system_sync_button)
+        time_row = QHBoxLayout()
+        time_row.setSpacing(6)
+        date_block = QVBoxLayout()
+        date_block.setSpacing(1)
+        date_block.addWidget(QLabel("Device date:"))
+        date_block.addWidget(self.system_date_edit)
+        time_block = QVBoxLayout()
+        time_block.setSpacing(1)
+        time_block.addWidget(QLabel("Device time:"))
+        time_block.addWidget(self.system_time_edit)
+        time_row.addLayout(date_block)
+        time_row.addLayout(time_block)
+        sync_block = QVBoxLayout()
+        sync_block.addStretch(1)
+        sync_block.addWidget(self.system_sync_button)
+        time_row.addLayout(sync_block, 1)
+        left_buttons.addLayout(time_row)
         left_buttons.addWidget(self.system_channels_button)
         left_buttons.addWidget(self.system_reboot_button)
         self.system_qr_label = QLabel()
@@ -11521,7 +11571,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.tabs, 1)
         right_layout.addLayout(bottom_bar)
 
-        right_panel.setFixedWidth(470)
+        right_panel.setFixedWidth(500)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.db_panel)
         splitter.addWidget(table_panel)
@@ -11529,7 +11579,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([0, 900, 470])
+        splitter.setSizes([0, 900, 500])
         splitter.setHandleWidth(1)
         self.main_splitter = splitter
         self.db_panel.setVisible(False)
@@ -11639,10 +11689,15 @@ class MainWindow(QMainWindow):
         return scroll
 
     def _make_device_tabs_scrollable(self):
+        if getattr(self, "_device_tabs_scrollable", False):
+            return
+        self._device_tabs_scrollable = True
         entries = []
         for index in range(self.tabs.count()):
             panel = self.tabs.widget(index)
             if panel is getattr(self, "_settings_scroll", None):
+                continue
+            if panel.property("xm_tab_no_scroll"):
                 continue
             entries.append((index, panel, self.tabs.tabText(index)))
         if not entries:
@@ -12551,8 +12606,11 @@ class MainWindow(QMainWindow):
             if panel in (getattr(self, "_settings_scroll", None),
                          getattr(self, "_settings_panel", None)):
                 continue
-            for cls in (QLineEdit, QComboBox, QCheckBox, QSpinBox, QPushButton,
-                        QTableWidget):
+            info = self._private_tab_info(index)
+            if info is not None and not info.get("device", True):
+                continue
+            for cls in (QLineEdit, QComboBox, QCheckBox, QSpinBox, QDateEdit,
+                        QTimeEdit, QPushButton, QTableWidget):
                 widgets.extend(panel.findChildren(cls))
         widgets.extend((self.nat_group, self.ntp_group, self.upgrade_group,
                         self.wifi_group))
@@ -12586,6 +12644,7 @@ class MainWindow(QMainWindow):
         self._update_channels_button()
         self._update_encode_table_button()
         self._update_camera_table_button()
+        QTimer.singleShot(0, self._clear_system_time_selection)
 
     def _disable_device_tabs(self):
         for widget in self._device_tab_widgets():
@@ -12607,6 +12666,40 @@ class MainWindow(QMainWindow):
         self.encode_summary_group.setVisible(False)
         self.encode_status_group.setVisible(False)
         self._update_cloud_qr("")
+
+    def _system_time_fields_value(self):
+        date = self.system_date_edit.date()
+        time = self.system_time_edit.time()
+        return "%04d-%02d-%02d %02d:%02d:%02d" % (
+            date.year(), date.month(), date.day(),
+            time.hour(), time.minute(), time.second())
+
+    def _set_system_time_fields(self, value):
+        text = str(value or "").strip()
+        when = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                when = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                pass
+        if when is None:
+            when = datetime.now()
+        self.system_date_edit.setDate(
+            QDate(when.year, when.month, when.day))
+        self.system_time_edit.setTime(
+            QTime(when.hour, when.minute, when.second))
+        self._system_time_initial = self._system_time_fields_value()
+        QTimer.singleShot(0, self._clear_system_time_selection)
+
+    def _clear_system_time_selection(self):
+        for widget in (getattr(self, "system_date_edit", None),
+                       getattr(self, "system_time_edit", None)):
+            if widget is None:
+                continue
+            line = widget.findChild(QLineEdit)
+            if line is not None:
+                line.deselect()
 
     def _refresh_age_label(self):
         widget = getattr(self, "system_age_edit", None)
@@ -12630,6 +12723,11 @@ class MainWindow(QMainWindow):
             if panel in (getattr(self, "_settings_scroll", None),
                          getattr(self, "_settings_panel", None)):
                 continue
+            info = self._private_tab_info(index)
+            if info is not None and (
+                    not info.get("device", True)
+                    or not info.get("clear_on_disconnect", False)):
+                continue
             for widget in panel.findChildren(QWidget):
                 widget.blockSignals(True)
             for widget in panel.findChildren(QLineEdit):
@@ -12642,6 +12740,10 @@ class MainWindow(QMainWindow):
                 widget.setChecked(False)
             for widget in panel.findChildren(QSpinBox):
                 widget.setValue(widget.minimum())
+            for widget in panel.findChildren(QDateEdit):
+                widget.setDate(QDate.currentDate())
+            for widget in panel.findChildren(QTimeEdit):
+                widget.setTime(QTime.currentTime())
             for widget in panel.findChildren(QTableWidget):
                 widget.setRowCount(0)
             for widget in panel.findChildren(QWidget):
@@ -12951,11 +13053,44 @@ class MainWindow(QMainWindow):
             "fetch", device=device, label=label, changes={"keys": keys})
         self._sync_session_monitor()
 
+    def _private_tab_info(self, index):
+        if not hasattr(self, "_private_tabs"):
+            return None
+        panel = self.tabs.widget(index)
+        if panel is None:
+            return None
+        info = self._private_tabs.get(panel)
+        if info is None and isinstance(panel, QScrollArea):
+            info = self._private_tabs.get(panel.widget())
+        return info
+
+    def _builtin_tab_index(self, index):
+        builtin = 0
+        for position in range(self.tabs.count()):
+            if self._private_tab_info(position) is not None:
+                continue
+            if position == index:
+                return builtin
+            builtin += 1
+        return None
+
+    def _run_private_callback(self, callback):
+        try:
+            callback()
+        except Exception as error:
+            traceback.print_exc()
+            self._message("Private extension error: %s" % error)
+
     def _tab_fetch_keys(self, index):
-        # Tab titles are translated at runtime; match by construction order
-        # instead of the visible English text.
-        if 0 <= index < len(TAB_FETCH_KEYS):
-            return list(TAB_FETCH_KEYS[index][1])
+        # Private tabs supply their own keys. Built-in tabs keep the
+        # construction order from TAB_FETCH_KEYS even when private tabs are
+        # inserted between them and Settings.
+        info = self._private_tab_info(index)
+        if info is not None:
+            return list(info.get("fetch_keys") or ())
+        builtin = self._builtin_tab_index(index)
+        if builtin is not None and 0 <= builtin < len(TAB_FETCH_KEYS):
+            return list(TAB_FETCH_KEYS[builtin][1])
         return []
 
     def _request_fetch(self, keys):
@@ -12976,14 +13111,18 @@ class MainWindow(QMainWindow):
             changes={"keys": keys})
 
     def _on_tab_changed(self, index):
-        if self._connected_identity is None:
-            return
+        info = self._private_tab_info(index)
         keys = self._tab_fetch_keys(index)
-        missing = [key for key in keys if key not in self._fetched_keys]
-        if missing:
-            self._request_fetch(missing)
-        elif self._fetched_payload:
-            self._on_system_fetched({}, quiet=True)
+        if info is None or keys:
+            if self._connected_identity is not None:
+                missing = [key for key in keys if key not in self._fetched_keys]
+                if missing:
+                    self._request_fetch(missing)
+                elif self._fetched_payload:
+                    self._on_system_fetched({}, quiet=True)
+        callback = info.get("on_activated") if info else None
+        if callable(callback):
+            self._run_private_callback(callback)
 
     def _on_system_connected(self, name, thread=None):
         if thread is not None and thread is not self._netip_thread:
@@ -13194,6 +13333,13 @@ class MainWindow(QMainWindow):
 
     def _save_current_tab(self):
         index = self.tabs.currentIndex()
+        info = self._private_tab_info(index)
+        if info is not None:
+            handler = info.get("on_save")
+            if callable(handler):
+                self._run_private_callback(handler)
+            return
+        index = self._builtin_tab_index(index)
         if index == 0:
             self._apply_network()
         elif index == 1:
@@ -13415,6 +13561,9 @@ class MainWindow(QMainWindow):
                    "timezone": timezone,
                    "device_desc": device_desc,
                    "preview_num": preview_num}
+        current_time = self._system_time_fields_value()
+        if current_time != self._system_time_initial:
+            changes["set_time"] = current_time
         if ability:
             changes["ability"] = ability
         self._start_system_action("apply", changes=changes, label="Applying")
@@ -14812,6 +14961,47 @@ class MainWindow(QMainWindow):
         """Folder the app runs from (the PyInstaller onedir folder when frozen)."""
         return APP_DIR
 
+    def add_tab(self, widget, title, *, device=True, fetch_keys=(),
+                on_save=None, on_activated=None, scroll=True,
+                clear_on_disconnect=False):
+        """Insert a tab supplied by a local extension before Settings.
+
+        ``fetch_keys`` requests the same device data as built-in tabs,
+        ``on_save`` handles the Save button, and ``on_activated`` runs when
+        the tab is opened. Set ``device=False`` for tabs that do not depend
+        on a connection.
+        """
+        if not isinstance(widget, QWidget):
+            raise TypeError("add_tab() requires a QWidget")
+        title = str(title or "").strip() or "Extension"
+        keys = fetch_keys
+        if isinstance(keys, str):
+            keys = (keys,)
+        keys = tuple(str(key) for key in (keys or ()) if str(key))
+        info = {
+            "device": bool(device),
+            "fetch_keys": keys,
+            "on_save": on_save if callable(on_save) else None,
+            "on_activated": (on_activated if callable(on_activated) else None),
+            "clear_on_disconnect": bool(clear_on_disconnect),
+        }
+        self._private_tabs[widget] = info
+        if not scroll:
+            widget.setProperty("xm_tab_no_scroll", True)
+        panel = widget
+        if (scroll and getattr(self, "_device_tabs_scrollable", False)
+                and not widget.property("xm_tab_no_scroll")):
+            panel = self._scrollable_tab(widget)
+        settings = getattr(self, "_settings_scroll", None)
+        position = self.tabs.indexOf(settings) if settings is not None else -1
+        if position < 0:
+            position = self.tabs.count()
+        self.tabs.insertTab(position, panel, title)
+        if device and self._connected_identity is None:
+            for child in widget.findChildren(QWidget):
+                child.setEnabled(False)
+        return widget
+
     def add_system_button(self, text, callback, tooltip=""):
         """Append a local/private action below the System tab buttons."""
         grid = getattr(self, "system_buttons_grid", None)
@@ -15299,6 +15489,8 @@ class MainWindow(QMainWindow):
         sender = self.sender()
         if isinstance(sender, NetipThread) and sender is not self._netip_thread:
             return
+        if "system_time" in payload:
+            self._set_system_time_fields(payload.get("system_time"))
         merged = dict(self._fetched_payload or {})
         merged.update(payload)
         payload = merged
@@ -15599,6 +15791,13 @@ class MainWindow(QMainWindow):
         sender = self.sender()
         if isinstance(sender, NetipThread) and sender is not self._netip_thread:
             return
+        sync = results.get("SyncTime")
+        if isinstance(sync, dict) and sync.get("Ret") == 100:
+            self._set_system_time_fields(
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        set_time = results.get("SetTime")
+        if isinstance(set_time, dict) and set_time.get("Ret") == 100:
+            self._system_time_initial = self._system_time_fields_value()
         summary = []
         for name, reply in results.items():
             ret = reply.get("Ret") if isinstance(reply, dict) else None
