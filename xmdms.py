@@ -571,6 +571,18 @@ RESULT_CODES = {
 }
 
 
+def results_need_reboot(results):
+    """True if any command reply in an applied-results mapping asks for a reboot."""
+    if not isinstance(results, dict):
+        return False
+    for reply in results.values():
+        if not isinstance(reply, dict):
+            continue
+        if reply.get("Ret") in (150, 603):
+            return True
+    return False
+
+
 APP_ICON_SVG_B64 = (
     "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+Cjwh"
     "LS0gQ3JlYXRlZCB3aXRoIElua3NjYXBlIChodHRwOi8vd3d3Lmlua3NjYXBlLm9yZy8pIC0tPgoK"
@@ -2243,6 +2255,60 @@ class NetipThread(QThread):
             if action == "sync_time":
                 self.applied.emit({"SyncTime": camera.set_time()})
                 return
+            if action == "ptz_control":
+                command = str(self._changes.get("command") or "").strip()
+                if not command:
+                    self.failed.emit("No PTZ command selected")
+                    return
+                def number(name, default):
+                    try:
+                        return int(self._changes.get(name, default))
+                    except (TypeError, ValueError):
+                        return default
+                channel = number("channel", 0)
+                step = number("step", 5)
+                preset = number("preset", -1)
+                tour = number("tour", 0)
+
+                def send_ptz(preset_value):
+                    return camera.set_command("OPPTZControl", {
+                        "Command": command,
+                        "Parameter": {
+                            "AUX": {"Number": 0, "Status": "On"},
+                            "Channel": channel,
+                            "MenuOpts": "Enter",
+                            "POINT": {"bottom": 0, "left": 0, "right": 0,
+                                      "top": 0},
+                            "Pattern": "SetBegin",
+                            "Preset": preset_value,
+                            "Step": step,
+                            "Tour": tour,
+                        },
+                    })
+
+                if bool(self._changes.get("pulse")):
+                    first = send_ptz(65535)
+                    time.sleep(0.25)
+                    second = send_ptz(-1)
+                    reply = second
+                    if not (isinstance(reply, dict)
+                            and reply.get("Ret") in camera.OK_CODES):
+                        reply = first
+                else:
+                    reply = send_ptz(preset)
+                self.applied.emit({"PTZ": reply})
+                return
+            if action == "keyboard":
+                key = str(self._changes.get("key") or "").strip()
+                if not key:
+                    self.failed.emit("No keyboard key selected")
+                    return
+                down = camera.keyDown(key)
+                time.sleep(0.2)
+                up = camera.keyUp(key)
+                self.applied.emit(
+                    {"Keyboard": up if isinstance(up, dict) else down})
+                return
             if action == "remote_devices":
                 self.fetched.emit({
                     "remote_devices": camera.get_command("NetWork.RemoteDeviceV3", 1042),
@@ -2860,6 +2926,110 @@ class NetipSessionThread(QThread):
             if not self._stop:
                 self.lost.emit("%s: %s" % (type(error).__name__, error))
         finally:
+            self._camera = None
+            if camera is not None:
+                try:
+                    camera.close()
+                except Exception:
+                    pass
+
+
+class PtzHoldThread(QThread):
+    """Repeat a PTZ command while a control button is held."""
+
+    failed = Signal(str)
+
+    def __init__(self, address, username, password, command, channel=0,
+                 step=5, cloud_id="", rps=True, port=34567, interval=0.4,
+                 no_md5=False, parent=None):
+        super().__init__(parent)
+        self._address = address
+        self._username = username
+        self._password = password
+        self._command = command
+        self._channel = int(channel)
+        self._step = int(step)
+        self._cloud_id = cloud_id or ""
+        self._rps = bool(rps)
+        self._port = int(port or 34567)
+        self._interval = max(0.1, float(interval))
+        self._no_md5 = bool(no_md5)
+        self._stop = False
+        self._camera = None
+
+    def stop(self):
+        self._stop = True
+
+    def _send(self, camera, preset):
+        reply = camera.set_command("OPPTZControl", {
+            "Command": self._command,
+            "Parameter": {
+                "AUX": {"Number": 0, "Status": "On"},
+                "Channel": self._channel,
+                "MenuOpts": "Enter",
+                "POINT": {"bottom": 0, "left": 0, "right": 0, "top": 0},
+                "Pattern": "SetBegin",
+                "Preset": preset,
+                "Step": self._step,
+                "Tour": 0,
+            },
+        })
+        if not (isinstance(reply, dict)
+                and reply.get("Ret") in camera.OK_CODES):
+            ret = reply.get("Ret") if isinstance(reply, dict) else None
+            raise RuntimeError("PTZ failed: Ret=%s" % ret)
+
+    def run(self):
+        camera = None
+        started = False
+        started_at = 0.0
+        try:
+            address = self._cloud_id or self._address
+            camera = DVRIPCam(address, user=self._username,
+                              password=self._password, port=self._port)
+            if self._no_md5:
+                camera.hash_pass = self._password
+            if self._cloud_id:
+                load_cloud_patch()
+                if self._rps:
+                    os.environ["RPS"] = "1"
+                else:
+                    os.environ.pop("RPS", None)
+                camera._cloud_device = True
+            elif not tcp_reachable(self._address, self._port):
+                self.failed.emit("Cannot connect to %s:%s (unreachable)" % (
+                    self._address, self._port))
+                return
+            camera.connect(timeout=8.0)
+            if not camera.login():
+                self.failed.emit(login_failure_text(camera))
+                return
+            self._camera = camera
+            try:
+                camera.alive.cancel()
+            except Exception:
+                pass
+            self._send(camera, 65535)
+            started = True
+            started_at = time.monotonic()
+            while not self._stop:
+                deadline = time.monotonic() + self._interval
+                while not self._stop and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                if self._stop:
+                    break
+                self._send(camera, 65535)
+        except Exception as error:
+            if not self._stop:
+                self.failed.emit(str(error))
+        finally:
+            if started and camera is not None:
+                if self._stop and time.monotonic() - started_at < 0.2:
+                    time.sleep(0.2)
+                try:
+                    self._send(camera, -1)
+                except Exception:
+                    pass
             self._camera = None
             if camera is not None:
                 try:
@@ -5829,6 +5999,7 @@ class DigitalChannelsDialog(QDialog):
 
     def __init__(self, device, username, password, parent=None):
         super().__init__(parent)
+        self._device = dict(device)
         self._address = device.get("ip") or ""
         self._cloud_id = device.get("cloud_id") or ""
         self._rps = bool(device.get("rps", True))
@@ -6048,6 +6219,15 @@ class DigitalChannelsDialog(QDialog):
             return decoder[0]
         return None
 
+    def _check_reboot(self, results):
+        parent = self.parent()
+        while parent is not None:
+            check = getattr(parent, "_check_reboot_required", None)
+            if callable(check):
+                check(results, self._device)
+                return
+            parent = parent.parent()
+
     def _start(self, action, handler, changes=None, on_failed=None):
         if self._thread is not None:
             return
@@ -6056,7 +6236,10 @@ class DigitalChannelsDialog(QDialog):
             cloud_id=self._cloud_id, rps=self._rps, changes=changes,
             port=self._port, parent=self, no_md5=self._no_md5)
         thread.fetched.connect(handler)
-        thread.applied.connect(handler)
+        def applied(results, callback=handler):
+            callback(results)
+            self._check_reboot(results)
+        thread.applied.connect(applied)
         thread.failed.connect(on_failed or self._on_failed)
         thread.finished.connect(self._on_finished)
         self._thread = thread
@@ -10006,6 +10189,15 @@ class DatabasePanel(QWidget):
         if identity in self._titles_ready and len(titles) >= count:
             self._send_channel_titles(device, titles)
 
+    def _check_reboot(self, results, device):
+        parent = self.parent()
+        while parent is not None:
+            check = getattr(parent, "_check_reboot_required", None)
+            if callable(check):
+                check(results, device)
+                return
+            parent = parent.parent()
+
     def _send_channel_titles(self, device, titles):
         if not titles:
             return
@@ -10020,9 +10212,10 @@ class DatabasePanel(QWidget):
             port=int(device.get("tcp_port") or 34567),
             no_md5=bool(device.get("no_md5")),
             parent=self)
-        thread.applied.connect(
-            lambda _result: self.status_label.setText(
-                tr("Channel renamed.")))
+        def applied(result, dev=device):
+            self.status_label.setText(tr("Channel renamed."))
+            self._check_reboot(result, dev)
+        thread.applied.connect(applied)
         thread.failed.connect(
             lambda text: self.status_label.setText(
                 tr("Rename failed: ") + str(text)))
@@ -10043,6 +10236,8 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._ipset_thread = None
         self._session_thread = None
+        self._ptz_thread = None
+        self._ptz_hold_command = None
         self._ipset_target = None
         self._search_seen = set()
         self._search_devices = {}
@@ -10055,6 +10250,8 @@ class MainWindow(QMainWindow):
         self._pass_failed = 0
         self._upgrade_threads = []
         self._upgrade_uploading = set()
+        self._upgrade_disconnect = set()
+        self._disconnect_after_upgrade = None
         self._upgrade_queue = []
         self._upgrade_active = False
         self._upgrade_total = 0
@@ -11415,6 +11612,124 @@ class MainWindow(QMainWindow):
         self._uart_ptz = None
         self._uart_rs485 = None
         self._ptz_current = None
+
+        self.ptz_control_channel_spin = QSpinBox()
+        self.ptz_control_channel_spin.setRange(0, 255)
+        self.ptz_control_step_spin = QSpinBox()
+        self.ptz_control_step_spin.setRange(1, 10)
+        self.ptz_control_step_spin.setValue(5)
+        self.ptz_control_preset_spin = QSpinBox()
+        self.ptz_control_preset_spin.setRange(1, 255)
+        self.ptz_control_tour_spin = QSpinBox()
+        self.ptz_control_tour_spin.setRange(1, 255)
+
+        def ptz_hold_button(text, command, width=42):
+            button = QPushButton(text)
+            button.setFixedSize(width, 30)
+            button.pressed.connect(
+                lambda cmd=command: self._start_ptz_hold(cmd))
+            button.released.connect(
+                lambda cmd=command: self._stop_ptz_hold(cmd))
+            return button
+
+        ptz_control_group = QGroupBox("PTZ control")
+        ptz_control_group.setStyleSheet(GROUP_BOX_STYLE)
+        ptz_control_grid = QGridLayout(ptz_control_group)
+        ptz_control_grid.setHorizontalSpacing(6)
+        ptz_control_grid.setVerticalSpacing(3)
+        ptz_control_grid.addWidget(QLabel("Channel:"), 0, 0)
+        ptz_control_grid.addWidget(self.ptz_control_channel_spin, 0, 1)
+        ptz_control_grid.addWidget(QLabel("Step:"), 0, 2)
+        ptz_control_grid.addWidget(self.ptz_control_step_spin, 0, 3)
+
+        direction_pad = QGridLayout()
+        direction_pad.setSpacing(3)
+        direction_tips = {
+            "DirectionLeftUp": "Up-left",
+            "DirectionUp": "Up",
+            "DirectionRightUp": "Up-right",
+            "DirectionLeft": "Left",
+            "DirectionRight": "Right",
+            "DirectionLeftDown": "Down-left",
+            "DirectionDown": "Down",
+            "DirectionRightDown": "Down-right",
+        }
+        for index, (label, command) in enumerate((
+                ("UL", "DirectionLeftUp"), ("↑", "DirectionUp"),
+                ("UR", "DirectionRightUp"), ("←", "DirectionLeft"),
+                ("Menu", "Menu"), ("→", "DirectionRight"),
+                ("DL", "DirectionLeftDown"), ("↓", "DirectionDown"),
+                ("DR", "DirectionRightDown"))):
+            if command == "Menu":
+                button = QPushButton(label)
+                button.setFixedSize(42, 30)
+                button.setToolTip("Open PTZ menu")
+                button.clicked.connect(
+                    lambda _=False: self._ptz_control("Menu", pulse=True))
+            else:
+                button = ptz_hold_button(label, command)
+                button.setToolTip(direction_tips[command])
+            direction_pad.addWidget(button, index // 3, index % 3)
+        ptz_control_grid.addLayout(direction_pad, 1, 0, 3, 2)
+
+        motion_grid = QGridLayout()
+        motion_grid.setSpacing(3)
+        for index, (label, command) in enumerate((
+                ("Zoom +", "ZoomTile"), ("Zoom -", "ZoomWide"),
+                ("Focus +", "FocusNear"), ("Focus -", "FocusFar"),
+                ("Iris +", "IrisLarge"), ("Iris -", "IrisSmall"))):
+            motion_grid.addWidget(
+                ptz_hold_button(label, command, 74),
+                index // 2, index % 2)
+        ptz_control_grid.addLayout(motion_grid, 1, 2, 3, 2)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        preset_row.addWidget(QLabel("Preset:"))
+        preset_row.addWidget(self.ptz_control_preset_spin)
+        for label, command in (("Set", "SetPreset"),
+                               ("Goto", "GotoPreset"),
+                               ("Clear", "ClearPreset")):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _=False, cmd=command:
+                self._ptz_control(
+                    cmd, preset=self.ptz_control_preset_spin.value(),
+                    step=0))
+            preset_row.addWidget(button)
+        preset_row.addStretch(1)
+        ptz_control_grid.addLayout(preset_row, 4, 0, 1, 4)
+
+        tour_row = QHBoxLayout()
+        tour_row.setSpacing(4)
+        tour_row.addWidget(QLabel("Tour:"))
+        tour_row.addWidget(self.ptz_control_tour_spin)
+        for label, command in (("Start", "StartTour"),
+                               ("Stop", "StopTour")):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _=False, cmd=command:
+                self._ptz_control(
+                    cmd, preset=0, step=0,
+                    tour=self.ptz_control_tour_spin.value()))
+            tour_row.addWidget(button)
+        tour_row.addStretch(1)
+        ptz_control_grid.addLayout(tour_row, 5, 0, 1, 4)
+
+        keyboard_group = QGroupBox("NETIP keyboard")
+        keyboard_group.setStyleSheet(GROUP_BOX_STYLE)
+        keyboard_grid = QGridLayout(keyboard_group)
+        keyboard_grid.setSpacing(3)
+        for index, (label, key) in enumerate((
+                ("Menu", "Menu"), ("Info", "Info"), ("Esc", "Esc"),
+                ("Func", "Func"), ("Shift", "Shift"), ("Up", "Up"),
+                ("Left", "Left"), ("Down", "Down"), ("Right", "Right"))):
+            button = QPushButton(label)
+            button.setFixedSize(70, 30)
+            button.clicked.connect(
+                lambda _=False, value=key: self._netip_key(value))
+            keyboard_grid.addWidget(button, index // 3, index % 3)
+
         ptz_group = QGroupBox("PTZ")
         ptz_group.setStyleSheet(GROUP_BOX_STYLE)
         ptz_grid = QGridLayout(ptz_group)
@@ -11464,6 +11779,8 @@ class MainWindow(QMainWindow):
 
         serial_layout = QVBoxLayout()
         serial_layout.setContentsMargins(4, 4, 4, 4)
+        serial_layout.addWidget(ptz_control_group)
+        serial_layout.addWidget(keyboard_group)
         serial_layout.addWidget(rs232_group)
         serial_layout.addWidget(ptz_group)
         serial_layout.addWidget(rs485_group)
@@ -12932,7 +13249,10 @@ class MainWindow(QMainWindow):
             return
         self._netip_queue.clear()
         self._cancel_netip_thread()
+        self._stop_ptz_hold()
         self._stop_session()
+        self._disconnect_after_upgrade = None
+        self._upgrade_disconnect.clear()
         self.db_panel.collapse_device(identity)
         self.db_panel.set_connected(None)
         self.model.set_connected(identity, False)
@@ -12965,7 +13285,8 @@ class MainWindow(QMainWindow):
         if self._connected_identity is None:
             self._stop_session()
             return
-        if self._netip_thread is not None or self._video_active():
+        if (self._netip_thread is not None or self._video_active()
+                or self._ptz_thread is not None):
             self._stop_session()
             return
         thread = self._session_thread
@@ -13455,7 +13776,19 @@ class MainWindow(QMainWindow):
             no_md5=bool(device.get("no_md5")))
         thread._xm_identity = job["identity"]
         thread.fetched.connect(job["on_fetched"] or self._on_system_fetched)
-        thread.applied.connect(job["on_applied"] or self._on_system_applied)
+        applied_handler = job["on_applied"] or self._on_system_applied
+        def applied(results, handler=applied_handler, dev=device,
+                    source=thread):
+            if source is not self._netip_thread:
+                return
+            handler(results)
+            self._check_reboot_required(results, dev)
+            if job["action"] == "upgrade" and isinstance(results, dict):
+                reply = results.get("Upgrade")
+                ret = reply.get("Ret") if isinstance(reply, dict) else None
+                if reply is None or ret in (100, 515):
+                    self._disconnect_after_upgrade = job["identity"]
+        thread.applied.connect(applied)
         thread.failed.connect(lambda text, t=thread: self._on_system_failed(text, t))
         thread.progress.connect(self._on_system_progress)
         thread.connected.connect(
@@ -13473,6 +13806,7 @@ class MainWindow(QMainWindow):
 
     def _start_system_action(self, action, changes=None, label="", device=None,
                              on_fetched=None, on_applied=None):
+        self._stop_ptz_hold()
         if device is None:
             device = self._system_target()
         if not isinstance(device, dict):
@@ -14688,6 +15022,76 @@ class MainWindow(QMainWindow):
             self.rs485_address_spin.setValue(address if 0 <= address <= 255 else 0)
         self.rs485_address_spin.setEnabled(rs485_entry is not None)
 
+    def _start_ptz_hold(self, command):
+        device = self._system_target()
+        if not isinstance(device, dict):
+            self._message("No device selected — pick a table row first.")
+            return
+        self._stop_ptz_hold()
+        username, password = self._device_credentials(device)
+        thread = PtzHoldThread(
+            device.get("ip") or "", username, password, command,
+            channel=int(self.ptz_control_channel_spin.value()),
+            step=int(self.ptz_control_step_spin.value()),
+            cloud_id=device.get("cloud_id") or "",
+            rps=bool(device.get("rps", True)),
+            port=int(device.get("tcp_port") or 34567),
+            no_md5=bool(device.get("no_md5")),
+            parent=self)
+        self._ptz_thread = thread
+        self._ptz_hold_command = command
+        self._stop_session()
+        thread.failed.connect(self._on_ptz_hold_failed)
+        thread.finished.connect(
+            lambda t=thread: self._on_ptz_hold_finished(t))
+        thread.start()
+        self._message("PTZ %s ..." % command)
+
+    def _stop_ptz_hold(self, command=None):
+        if command is not None and command != self._ptz_hold_command:
+            return
+        self._ptz_hold_command = None
+        thread = self._ptz_thread
+        if thread is not None:
+            thread.stop()
+
+    def _on_ptz_hold_finished(self, thread):
+        if thread is self._ptz_thread:
+            self._ptz_thread = None
+            self._ptz_hold_command = None
+            self._sync_session_monitor()
+        thread.deleteLater()
+
+    def _on_ptz_hold_failed(self, text):
+        self._message("PTZ: %s" % text)
+
+    def _ptz_control(self, command, preset=-1, step=None, tour=0, pulse=False):
+        device = self._system_target()
+        if not isinstance(device, dict):
+            self._message("No device selected — pick a table row first.")
+            return
+        if step is None:
+            step = self.ptz_control_step_spin.value()
+        changes = {
+            "command": command,
+            "channel": int(self.ptz_control_channel_spin.value()),
+            "step": int(step),
+            "preset": int(preset),
+            "tour": int(tour),
+            "pulse": bool(pulse),
+        }
+        self._start_system_action(
+            "ptz_control", changes=changes, label="PTZ %s on" % command)
+
+    def _netip_key(self, key):
+        device = self._system_target()
+        if not isinstance(device, dict):
+            self._message("No device selected — pick a table row first.")
+            return
+        self._start_system_action(
+            "keyboard", changes={"key": key},
+            label="NETIP key %s on" % key)
+
     def _serial_ptz_apply(self):
         self._ptz_store_current()
         changes = {}
@@ -15120,19 +15524,46 @@ class MainWindow(QMainWindow):
             "config_import", device=device,
             changes={"data": data},
             label="Importing config to",
-            on_applied=self._on_config_imported)
+            on_applied=lambda results, dev=device: self._on_config_imported(
+                results, dev))
 
-    def _on_config_imported(self, results):
+    def _on_config_imported(self, results, device=None):
         reply = results.get("config_import")
         ret = reply.get("Ret") if isinstance(reply, dict) else None
         text = RESULT_CODES.get(ret)
         if reply is None:
             self._message("Config imported — device is restarting.")
-        elif ret in (100, 603):
-            self._message("Config imported — device needs a restart.")
+        elif ret == 100:
+            self._message("Config imported.")
+        elif ret in (150, 603):
+            self._message("Config imported — restart required.")
         else:
             self._message("Config import: Ret=%s%s" % (
                 ret, " (%s)" % text if text else ""))
+
+    def _check_reboot_required(self, results, device=None):
+        if not results_need_reboot(results):
+            return False
+        self._restart_required(device)
+        return True
+
+    def _restart_required(self, device=None):
+        message = "The device must be restarted for the changes to take effect."
+        if device is None:
+            device = self._system_target()
+        if not isinstance(device, dict):
+            self._message(message)
+            return
+        answer = QMessageBox.question(
+            self, "Restart required",
+            "%s\n\nReboot %s now?" % (message, device.get("ip") or ""),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if answer == QMessageBox.StandardButton.Yes:
+            self._start_system_action(
+                "reboot", device=device, label="Rebooting")
+        else:
+            self._message(message)
 
     def _reset_config(self):
         device = self._system_target()
@@ -15156,15 +15587,19 @@ class MainWindow(QMainWindow):
             return
         self._start_system_action(
             "reset_config", changes={"config": dialog.payload()},
-            label="Resetting config on", on_applied=self._on_reset_applied)
+            label="Resetting config on",
+            on_applied=lambda results, dev=device: self._on_reset_applied(
+                results, dev))
 
-    def _on_reset_applied(self, results):
+    def _on_reset_applied(self, results, device=None):
         reply = results.get("OPDefaultConfig")
         ret = reply.get("Ret") if isinstance(reply, dict) else None
-        if ret == 100:
+        if reply is None:
+            self._message("Config reset — device is restarting.")
+        elif ret == 100:
             self._message("Config reset done.")
-        elif ret == 603:
-            self._message("Config reset — device needs a restart.")
+        elif ret in (150, 603):
+            self._message("Config reset — restart required.")
         else:
             text = RESULT_CODES.get(ret)
             self._message("Config reset: Ret=%s%s" % (
@@ -15300,7 +15735,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self, "Upgrade firmware",
             "Upload %s to %s?\n\n"
-            "The selected devices will upgrade and may reboot." % (
+            "The selected devices will upgrade and reboot." % (
                 os.path.basename(path), target))
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -15402,7 +15837,9 @@ class MainWindow(QMainWindow):
             self._upgrade_done += 1
             self.model.set_progress(identity, 100)
             self.model.set_provision_state(identity, "ok")
-            self._message("Firmware upgraded on %s" % label)
+            self._message("Firmware upgraded on %s — device is rebooting." % label)
+            if self._connected_identity == identity:
+                self._upgrade_disconnect.add(identity)
         else:
             self._upgrade_failed += 1
             self.model.set_provision_state(identity, "failed")
@@ -15423,6 +15860,10 @@ class MainWindow(QMainWindow):
         identity = DeviceTableModel.identity(device)
         self._upgrade_uploading.discard(identity)
         self.model.clear_progress(identity)
+        if identity in self._upgrade_disconnect:
+            self._upgrade_disconnect.discard(identity)
+            if self._connected_identity == identity:
+                self._drop_connection("Upgrade complete — disconnected.")
         self._start_next_upgrade_job()
 
     def _cloud_upgrade(self):
@@ -15852,6 +16293,12 @@ class MainWindow(QMainWindow):
         self._update_encode_table_button()
         self._update_camera_table_button()
         self._fetch_in_progress = False
+        if self._disconnect_after_upgrade is not None:
+            identity = self._disconnect_after_upgrade
+            self._disconnect_after_upgrade = None
+            if identity == self._connected_identity:
+                self._drop_connection("Upgrade complete — disconnected.")
+                return
         if self._pending_fetch_keys and self._connected_identity is not None:
             pending = set(self._pending_fetch_keys)
             self._pending_fetch_keys = set()
@@ -16355,6 +16802,7 @@ class MainWindow(QMainWindow):
             self._pass_failed += 1
             self.model.set_provision_state(identity, "failed")
             self._message("Password change on %s failed: Ret=%s" % (label, ret))
+        self._check_reboot_required(payload, device)
 
     def _on_password_failed(self, device, text):
         identity = DeviceTableModel.identity(device)
@@ -16527,6 +16975,9 @@ class MainWindow(QMainWindow):
             ret = reply.get("Ret") if isinstance(reply, dict) else None
             summary.append("%s Ret=%s" % (name, ret))
         self._message("Network config: " + (", ".join(summary) if summary else "nothing to set"))
+        pending = self._pending_network
+        device = pending[0] if pending else None
+        self._check_reboot_required(results, device)
 
     def _on_network_config_failed(self, text):
         self._message("Network config failed: %s" % text)
@@ -16635,6 +17086,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._save_database_panel_state()
         self._stop_session()
+        ptz_thread = self._ptz_thread
+        self._ptz_thread = None
+        self._ptz_hold_command = None
+        if ptz_thread is not None:
+            ptz_thread.stop()
+            ptz_thread.wait(10000)
         if hasattr(self, "db_panel"):
             self.db_panel.stop()
         channels_dialog = self._channels_dialog
