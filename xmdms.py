@@ -3038,11 +3038,167 @@ class PtzHoldThread(QThread):
                     pass
 
 
+def alarm_event_from_payload(payload, source=""):
+    if not isinstance(payload, dict):
+        return None
+    info = payload.get("AlarmInfo")
+    if isinstance(info, list) and info:
+        info = info[0]
+    event = dict(info) if isinstance(info, dict) else {}
+    for key in ("Channel", "Event", "Status", "ObjectType",
+                "StartTime", "RegionId"):
+        if key in payload and key not in event:
+            event[key] = payload[key]
+    if event:
+        bus = query_log_bus()
+        if bus is not None:
+            header = "← 1504 AlarmInfo"
+            if source:
+                header += " [%s]" % source
+            bus.add(header, event)
+    return event or None
+
+
+class NetipAlarmThread(QThread):
+    """Second NETIP session listening for 1504 alarm pushes."""
+
+    event = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, address, username, password, cloud_id="", rps=True,
+                 port=34567, no_md5=False, parent=None):
+        super().__init__(parent)
+        self._address = address
+        self._username = username
+        self._password = password
+        self._cloud_id = cloud_id or ""
+        self._rps = bool(rps)
+        self._port = int(port or 34567)
+        self._no_md5 = bool(no_md5)
+        self._stop = False
+        self._camera = None
+
+    def stop(self):
+        self._stop = True
+        camera = self._camera
+        if camera is not None:
+            try:
+                if camera.socket is not None:
+                    camera.socket.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+
+    def _emit_event(self, payload):
+        event = alarm_event_from_payload(payload, "control")
+        if event:
+            self.event.emit(event)
+
+    def run(self):
+        camera = None
+        try:
+            address = self._cloud_id or self._address
+            camera = DVRIPCam(address, user=self._username,
+                              password=self._password, port=self._port)
+            if self._no_md5:
+                camera.hash_pass = self._password
+            if self._cloud_id:
+                load_cloud_patch()
+                if self._rps:
+                    os.environ["RPS"] = "1"
+                else:
+                    os.environ.pop("RPS", None)
+                camera._cloud_device = True
+            elif not tcp_reachable(self._address, self._port):
+                self.failed.emit("Cannot connect to %s:%s (unreachable)" % (
+                    self._address, self._port))
+                return
+            camera.connect(timeout=8.0)
+            if self._stop:
+                return
+            if not camera.login():
+                self.failed.emit(login_failure_text(camera))
+                return
+            self._camera = camera
+            try:
+                camera.alive.cancel()
+            except Exception:
+                pass
+            reply = camera.send(1500, {
+                "Name": "",
+                "SessionID": "0x%08X" % camera.session,
+            })
+            if not (isinstance(reply, dict)
+                    and reply.get("Ret") in camera.OK_CODES):
+                self.failed.emit("Alarm listener was rejected")
+                return
+            camera.socket.settimeout(0.5)
+            last_keepalive = time.monotonic()
+            keep_interval = max(
+                10.0, float(getattr(camera, "alive_time", 20) or 20) - 2.0)
+            while not self._stop:
+                try:
+                    header = camera.socket_recv(20)
+                except Exception:
+                    header = None
+                if self._stop:
+                    break
+                if not header:
+                    if time.monotonic() - last_keepalive >= keep_interval:
+                        camera.socket.settimeout(3.0)
+                        try:
+                            reply = camera.send(1006, {
+                                "Name": "KeepAlive",
+                                "SessionID": "0x%08X" % camera.session,
+                            })
+                        finally:
+                            try:
+                                camera.socket.settimeout(0.5)
+                            except OSError:
+                                pass
+                        if not (isinstance(reply, dict)
+                                and reply.get("Ret") in camera.OK_CODES):
+                            if not self._stop:
+                                self.failed.emit("Alarm keepalive failed")
+                            break
+                        last_keepalive = time.monotonic()
+                    continue
+                if len(header) < 20:
+                    break
+                try:
+                    _head, _version, _session, _seq, msgid, length = (
+                        struct.unpack("BB2xII2xHI", header))
+                except struct.error:
+                    break
+                if length > (4 << 20):
+                    break
+                camera.socket.settimeout(3.0)
+                try:
+                    payload = camera.receive_json(length, msgid)
+                finally:
+                    try:
+                        camera.socket.settimeout(0.5)
+                    except OSError:
+                        pass
+                if msgid == 1504 and isinstance(payload, dict):
+                    self._emit_event(payload)
+        except Exception as error:
+            if not self._stop:
+                self.failed.emit(str(error))
+        finally:
+            self._camera = None
+            if camera is not None:
+                try:
+                    camera.close()
+                except Exception:
+                    pass
+
+
 class NetipVideoThread(QThread):
     status = Signal(str)
     stats = Signal(str)
     failed = Signal(str)
     keyframe = Signal()
+    alarm = Signal(dict)
     MEDIA_TYPES = {0: "jpeg", 1: "mpeg4", 2: "h264", 3: "h265"}
 
     def __init__(self, address, username, password, sink, cloud_id="", rps=True,
@@ -3070,6 +3226,7 @@ class NetipVideoThread(QThread):
         self._last_seq = None
         self._packet_seq = None
         self._resync = False
+        self._alarm_gap = False
         self._socket_closed = False
         self._need_keyframe = True
         self._win_start = 0.0
@@ -3128,6 +3285,7 @@ class NetipVideoThread(QThread):
         self._empty_reads = 0
         self._last_seq = None
         self._resync = False
+        self._alarm_gap = False
         self._need_keyframe = True
         self._win_start = 0.0
         self._win_frames = 0
@@ -3195,6 +3353,7 @@ class NetipVideoThread(QThread):
             self._claim_and_start(camera, self._stream, self._channel)
             self._last_seq = None
             self._resync = False
+            self._alarm_gap = False
             self._need_keyframe = True
             self._win_start = 0.0
             self._win_frames = 0
@@ -3260,34 +3419,73 @@ class NetipVideoThread(QThread):
         data_type = struct.unpack(">I", payload[:4])[0]
         return data_type in (0x1FC, 0x1FE, 0x1FD, 0x1FA, 0x1F9) or data_type == 0xFFD8FFE0
 
+    def _handle_alarm_payload(self, payload):
+        try:
+            data = bytes(payload).split(b"\x00", 1)[0].strip(b"\r\n ")
+            obj = json.loads(data.decode("utf-8", "replace"))
+        except Exception:
+            return
+        event = alarm_event_from_payload(obj, "video")
+        if event:
+            self._alarm_gap = True
+            self.alarm.emit(event)
+
     def _read_packet(self, camera):
         """Read one media packet (20-byte header + payload), boundary safe."""
-        if self._pending is not None or self._stop:
-            return None
-        header = self._recv_exact(camera, 20, 0.5, allow_pending=True)
-        if header is None:
-            return None
-        try:
-            head, version, _session, seq, _total, _cur, msgid, payload_len = struct.unpack(
-                "BB2xIIBBHI", header)
-        except struct.error:
+        while not self._stop:
+            if self._pending is not None:
+                return None
+            header = self._recv_exact(camera, 20, 0.5, allow_pending=True)
+            if header is None:
+                return None
+            try:
+                head, version, _session, seq, _total, _cur, msgid, payload_len = (
+                    struct.unpack("BB2xIIBBHI", header))
+            except struct.error:
+                self._resync = True
+                return None
+            if head == 0xFF and version == 1:
+                if msgid == 1412 and payload_len <= (4 << 20):
+                    payload = self._recv_exact(camera, payload_len, 1.5)
+                    if payload is None:
+                        self._resync = True
+                        return None
+                    if (self._last_seq is not None
+                            and not self._alarm_gap
+                            and seq != ((self._last_seq + 1) & 0xFFFFFFFF)
+                            and not self._is_frame_start(payload)):
+                        self._resync = True
+                        return None
+                    self._alarm_gap = False
+                    self._last_seq = seq
+                    self._packet_seq = seq
+                    return payload
+                if msgid == 1504 and payload_len <= (4 << 20):
+                    payload = self._recv_exact(camera, payload_len, 1.5)
+                    if payload is None:
+                        self._resync = True
+                        return None
+                    self._handle_alarm_payload(payload)
+                    continue
+            try:
+                _ch, _cv, _cs, _cq, c_msgid, c_len = struct.unpack(
+                    "BB2xII2xHI", header)
+            except struct.error:
+                self._resync = True
+                return None
+            if _ch == 0xFF and c_len <= (4 << 20):
+                payload = self._recv_exact(camera, c_len, 1.5)
+                if payload is None:
+                    self._resync = True
+                    return None
+                if c_msgid == 1504:
+                    self._handle_alarm_payload(payload)
+                else:
+                    self._alarm_gap = True
+                continue
             self._resync = True
             return None
-        if head != 0xFF or version != 1 or msgid != 1412 or payload_len > (4 << 20):
-            self._resync = True
-            return None
-        payload = self._recv_exact(camera, payload_len, 1.5)
-        if payload is None:
-            self._resync = True
-            return None
-        if (self._last_seq is not None
-                and seq != ((self._last_seq + 1) & 0xFFFFFFFF)
-                and not self._is_frame_start(payload)):
-            self._resync = True
-            return None
-        self._last_seq = seq
-        self._packet_seq = seq
-        return payload
+        return None
 
     def _resync_packet(self, camera):
         """Scan the byte stream for the next valid media packet header."""
@@ -3295,26 +3493,55 @@ class NetipVideoThread(QThread):
         while not self._stop:
             if self._pending is not None:
                 return None
-            index = self._recv_buf.find(b"\xff\x01")
+            idx1 = self._recv_buf.find(b"\xff\x01")
+            idx0 = self._recv_buf.find(b"\xff\x00")
+            candidates = [value for value in (idx1, idx0) if value >= 0]
+            index = min(candidates) if candidates else -1
             if index >= 0 and len(self._recv_buf) >= index + 20:
                 candidate = bytes(self._recv_buf[index:index + 20])
                 try:
-                    _head, _version, _session, seq, _total, _cur, msgid, payload_len = struct.unpack(
-                        "BB2xIIBBHI", candidate)
+                    head, version, _session, seq, _total, _cur, msgid, payload_len = (
+                        struct.unpack("BB2xIIBBHI", candidate))
                 except struct.error:
                     del self._recv_buf[:index + 1]
                     continue
-                if msgid == 1412 and payload_len <= (4 << 20):
+                if (head == 0xFF and version == 1 and msgid == 1412
+                        and payload_len <= (4 << 20)):
                     del self._recv_buf[:index + 20]
                     payload = self._recv_exact(camera, payload_len, 1.5)
                     if payload is None:
                         return None
-                    if (self._last_seq is None
+                    if (self._last_seq is None or self._alarm_gap
                             or seq == ((self._last_seq + 1) & 0xFFFFFFFF)
                             or self._is_frame_start(payload)):
+                        self._alarm_gap = False
                         self._last_seq = seq
                         self._packet_seq = seq
                         return payload
+                    continue
+                if (head == 0xFF and version == 1 and msgid == 1504
+                        and payload_len <= (4 << 20)):
+                    del self._recv_buf[:index + 20]
+                    payload = self._recv_exact(camera, payload_len, 1.5)
+                    if payload is None:
+                        return None
+                    self._handle_alarm_payload(payload)
+                    continue
+                try:
+                    _ch, _cv, _cs, _cq, c_msgid, c_len = struct.unpack(
+                        "BB2xII2xHI", candidate)
+                except struct.error:
+                    del self._recv_buf[:index + 1]
+                    continue
+                if _ch == 0xFF and c_len <= (4 << 20):
+                    del self._recv_buf[:index + 20]
+                    payload = self._recv_exact(camera, c_len, 1.5)
+                    if payload is None:
+                        return None
+                    if c_msgid == 1504:
+                        self._handle_alarm_payload(payload)
+                    else:
+                        self._alarm_gap = True
                     continue
                 del self._recv_buf[:index + 1]
                 continue
@@ -7897,6 +8124,27 @@ class VideoPanel(QWidget):
     frame_in = Signal(object, object, object)
     jpeg_in = Signal(object)
     audio_in = Signal(object)
+    event_status = Signal(str, str)
+    ALARM_STYLES = {
+        "human": ("HUMAN", "#C62828"),
+        "face": ("FACE", "#AD1457"),
+        "car": ("CAR", "#1565C0"),
+        "plate": ("PLATE", "#0D47A1"),
+        "pet": ("PET", "#6A1B9A"),
+        "fire": ("FIRE", "#D84315"),
+        "leave": ("LEAVE", "#5D4037"),
+        "region": ("REGION", "#37474F"),
+        "doorbell": ("DOORBELL", "#00838F"),
+        "motion": ("MOTION", "#EF6C00"),
+        "alarm": ("ALARM", "#B71C1C"),
+        "blind": ("BLIND", "#616161"),
+        "loss": ("LOSS", "#616161"),
+        "io": ("IO", "#8E24AA"),
+        "storage": ("STORAGE", "#C62828"),
+        "fall": ("FALL", "#6A1B9A"),
+        "analyze": ("ANALYZE", "#455A64"),
+        "event": ("EVENT", "#455A64"),
+    }
 
     def __init__(self, parent=None, compact=False):
         super().__init__(parent)
@@ -8028,6 +8276,13 @@ class VideoPanel(QWidget):
             layout.addWidget(self.controls_widget)
         self.focus_overlay = FocusOverlay(self)
         self.focus_overlay.hide()
+        self._alarm_thread = None
+        self._alarm_error_shown = False
+        self._alarm_current = None
+        self._alarm_seen_at = 0.0
+        self._alarm_timer = QTimer(self)
+        self._alarm_timer.setSingleShot(True)
+        self._alarm_timer.timeout.connect(self._clear_alarm_event)
 
         self._stream_device = None
         self._player = QMediaPlayer(self) if QT_MULTIMEDIA else None
@@ -8514,14 +8769,128 @@ class VideoPanel(QWidget):
         thread.stats.connect(self._on_stats)
         thread.failed.connect(self._on_failed)
         thread.keyframe.connect(self._on_keyframe)
+        thread.alarm.connect(self._on_alarm_event)
         thread.finished.connect(self._on_finished)
         self._thread = thread
         self._active = True
         self._watchdog.start(6000)
         thread.start()
+        self._start_alarm_listener()
         self.focus_button.setEnabled(True)
         self._set_split_enabled(True)
         return True
+
+    def _start_alarm_listener(self):
+        self._stop_alarm_listener()
+        if self._compact or not isinstance(self._device, dict):
+            return
+        self._alarm_error_shown = False
+        thread = NetipAlarmThread(
+            self._device.get("ip") or "", self._username, self._password,
+            cloud_id=self._device.get("cloud_id") or "",
+            rps=bool(self._device.get("rps", True)),
+            port=int(self._device.get("tcp_port") or 34567),
+            no_md5=bool(self._device.get("no_md5")),
+            parent=self)
+        thread.event.connect(self._on_alarm_event)
+        thread.failed.connect(self._on_alarm_failed)
+        thread.finished.connect(thread.deleteLater)
+        self._alarm_thread = thread
+        thread.start()
+
+    def _stop_alarm_listener(self, wait=False):
+        thread = self._alarm_thread
+        self._alarm_thread = None
+        if thread is not None:
+            thread.stop()
+            if wait:
+                thread.wait(3000)
+            thread.finished.connect(thread.deleteLater)
+
+    def _on_alarm_failed(self, text):
+        if self._alarm_error_shown or not self._active:
+            return
+        self._alarm_error_shown = True
+        self.notice.emit(tr("Events: ") + str(text))
+
+    @staticmethod
+    def _alarm_kind(event):
+        text = " ".join(str(event.get(key) or "") for key in (
+            "Event", "Type", "ObjectType", "MainType", "SubType")).lower()
+        if "fire" in text or "smoke" in text:
+            return "fire"
+        if "plate" in text or "lpr" in text or "license" in text:
+            return "plate"
+        if "leave" in text:
+            return "leave"
+        if "fall" in text:
+            return "fall"
+        if "human" in text or "person" in text or "people" in text:
+            return "human"
+        if "face" in text:
+            return "face"
+        if "car" in text or "vehicle" in text:
+            return "car"
+        if any(word in text for word in ("pet", "dog", "cat")):
+            return "pet"
+        if ("region" in text or "intrusion" in text
+                or "perimeter" in text or "tripwire" in text):
+            return "region"
+        if "doorbell" in text or "call" in text:
+            return "doorbell"
+        if "motion" in text or "move" in text:
+            return "motion"
+        if "blind" in text:
+            return "blind"
+        if "loss" in text:
+            return "loss"
+        if any(word in text for word in (
+                "localio", "localalarm", "netalarm", "manualalarm")):
+            return "io"
+        if "storage" in text or "storrage" in text or "disk" in text:
+            return "storage"
+        if "analyze" in text or "analyse" in text:
+            return "analyze"
+        if "alarm" in text:
+            return "alarm"
+        return "event"
+
+    def _on_alarm_event(self, event):
+        if not self._active or not isinstance(event, dict):
+            return
+        channel = event.get("Channel")
+        if channel is not None:
+            try:
+                if int(channel) != self._channel:
+                    return
+            except (TypeError, ValueError):
+                pass
+        name = str(event.get("Event") or event.get("Type") or "").strip()
+        status = str(event.get("Status") or event.get("Action")
+                     or "Start").strip().lower()
+        kind = self._alarm_kind(event)
+        if status in ("stop", "end", "0", "false", "inactive", "off"):
+            self._clear_alarm_event(kind)
+            return
+        label, color = self.ALARM_STYLES.get(kind, self.ALARM_STYLES["event"])
+        if kind == "event" and name:
+            label = name.replace("Detect", "").upper()[:16] or "EVENT"
+        self._alarm_current = kind
+        self._alarm_seen_at = time.monotonic()
+        self.event_status.emit(label, color)
+        self._alarm_timer.start(8000)
+
+    def _clear_alarm_event(self, kind=None):
+        if kind is not None and kind != self._alarm_current:
+            return
+        if kind is not None:
+            remaining = 3.0 - (time.monotonic() - self._alarm_seen_at)
+            if remaining > 0:
+                self._alarm_timer.start(int(remaining * 1000))
+                return
+        self._alarm_current = None
+        self._alarm_timer.stop()
+        self.event_status.emit("", "")
 
     def _on_keyframe(self):
         self._switch_target = None
@@ -8541,6 +8910,7 @@ class VideoPanel(QWidget):
             self.notice.emit("Recording stopped for the channel switch")
         self._stream = stream
         self._channel = int(channel)
+        self._clear_alarm_event()
         self._switch_target = (stream, int(channel))
         self._switch_mark = self._decoded
         self._focus_last = 0.0
@@ -8573,6 +8943,8 @@ class VideoPanel(QWidget):
 
     def _stop_main_stream(self, wait=False):
         self._active = False
+        self._stop_alarm_listener(wait=wait)
+        self._clear_alarm_event()
         self._reset_focus()
         self._watchdog.stop()
         self._switch_timer.stop()
@@ -8669,6 +9041,8 @@ class VideoPanel(QWidget):
         thread = self.sender()
         if thread is self._thread:
             self._thread = None
+            self._stop_alarm_listener()
+            self._clear_alarm_event()
         if thread is not None:
             thread.deleteLater()
 
@@ -11973,12 +12347,27 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.netip_cancel_button)
         status_layout.addWidget(status_separator())
         status_layout.addWidget(self.middle_stack, 6)
+        event_slot = QWidget()
+        event_slot.setFixedWidth(120)
+        event_slot_layout = QHBoxLayout(event_slot)
+        event_slot_layout.setContentsMargins(0, 0, 0, 0)
+        event_slot_layout.setSpacing(0)
+        event_slot_layout.addStretch(1)
+        self.event_status_label = QLabel("")
+        self.event_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.event_status_label.setMaximumWidth(120)
+        self.event_status_label.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        self.event_status_label.setVisible(False)
+        event_slot_layout.addWidget(self.event_status_label)
+        status_layout.addWidget(event_slot)
         status_layout.addWidget(status_separator())
         status_layout.addWidget(self.connection_label)
         self.status_bar.addPermanentWidget(status_widget, 1)
         self.video_panel.status_changed.connect(self._on_video_status)
         self.video_panel.notice.connect(self._message)
         self.video_panel.lost.connect(self._on_video_lost)
+        self.video_panel.event_status.connect(self._on_video_event)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.currentChanged.connect(self._on_settings_tab)
         self._disable_device_tabs()
@@ -12100,6 +12489,23 @@ class MainWindow(QMainWindow):
         self.video_status_label.setText(text)
         if text:
             self.middle_stack.setCurrentWidget(self.video_status_label)
+
+    def _on_video_event(self, text, color):
+        label = getattr(self, "event_status_label", None)
+        if label is None:
+            return
+        text = str(text or "")
+        if not text:
+            label.clear()
+            label.setStyleSheet("")
+            label.setVisible(False)
+            return
+        label.setText(text)
+        label.setStyleSheet(
+            "background-color: %s; color: white; border-radius: 3px;"
+            " padding: 1px 6px; font-weight: bold;"
+            % (color or "#455A64"))
+        label.setVisible(True)
 
     def _refresh_status_text(self):
         count = self.model.rowCount()
